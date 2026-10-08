@@ -29,10 +29,16 @@ BASE_OPTS = {
     "retries": 3,
 }
 
-# রিপোতে cookies.txt থাকলে সেটা ব্যবহার করবে (ঐচ্ছিক, YouTube ব্লক এড়াতে সাহায্য করতে পারে)
-COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-if os.path.exists(COOKIE_FILE):
-    BASE_OPTS["cookiefile"] = COOKIE_FILE
+# কুকি ফাইল (YouTube ব্লক এড়াতে)। Render-এর Secret File এখানে থাকে: /etc/secrets/cookies.txt
+# ফাইলটা read-only, আর yt-dlp কুকি আপডেট করতে লিখতে চায়, তাই লেখা যায় এমন জায়গায় কপি করে নিই।
+COOKIES_LOADED = False
+for _src in ("/etc/secrets/cookies.txt", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")):
+    if os.path.exists(_src):
+        _dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        shutil.copyfile(_src, _dst)
+        BASE_OPTS["cookiefile"] = _dst
+        COOKIES_LOADED = True
+        break
 
 
 def valid_url(url):
@@ -51,7 +57,7 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify(ok=True, yt_dlp=yt_dlp.version.__version__)
+    return jsonify(ok=True, yt_dlp=yt_dlp.version.__version__, cookies_loaded=COOKIES_LOADED)
 
 
 @app.route("/api/info", methods=["POST"])
