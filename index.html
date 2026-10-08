@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ভিডিও ডাউনলোডার</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { --bg:#f4f6fb; --card:#fff; --text:#1c2230; --muted:#6b7385; --accent:#4f46e5; --err:#d93025; }
   @media (prefers-color-scheme: dark) {
@@ -60,7 +61,7 @@
   </div>
 
   <div class="result" id="result">
-    <p>সরাসরি ডাউনলোড লিংক পাওয়া গেছে। নিচের বাটনে চাপলে ভিডিও নতুন ট্যাবে খুলবে। সেখান থেকে ব্রাউজারের মেনু (⋮) → <b>Download</b> চাপুন, বা ভিডিওতে লং-প্রেস করে <b>Save video</b> বেছে নিন।</p>
+    <p>সরাসরি ডাউনলোড লিংক পাওয়া গেছে। নিচের বাটনে চাপলে ভিডিও ব্রাউজারে খুলবে। সেখান থেকে ব্রাউজারের মেনু (⋮) → <b>Download</b> চাপুন, বা ভিডিওতে লং-প্রেস করে <b>Save video</b> বেছে নিন।</p>
     <a class="btn" id="directLink" href="#" target="_blank" rel="noopener noreferrer">সরাসরি ভিডিও খুলুন</a>
     <a class="btn alt" id="serverLink" href="#">সরাসরি না চললে সার্ভার দিয়ে ডাউনলোড</a>
   </div>
@@ -72,11 +73,23 @@
 <script>
   // একই Render সার্ভার থেকে সাইট চালালে খালি রাখুন।
   // আলাদা জায়গায় রাখলে শেষে "/" ছাড়া লিংক দিন, যেমন: "https://downloader-yu1r.onrender.com"
-  const API_BASE = "https://downloader-yu1r.onrender.com";
+  const API_BASE = "";
 
   const $ = id => document.getElementById(id);
   const msg = (t, err) => { $("msg").textContent = t; $("msg").className = err ? "err" : ""; };
   const errText = d => (d.error || "সমস্যা হয়েছে") + (d.detail ? " — " + d.detail : "");
+
+  // ---------- Telegram Mini App সাপোর্ট ----------
+  const TG = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(TG && TG.initData);
+  if (TG) { TG.ready(); TG.expand(); }
+
+  // Telegram-এর ভেতরে হলে ফোনের মূল ব্রাউজারে খুলবে, নইলে সাধারণভাবে
+  function goDownload(url) {
+    const full = new URL(url, location.href).href;
+    if (inTelegram) TG.openLink(full);
+    else window.location.href = full;
+  }
 
   function fmt(s) {
     if (!s) return "";
@@ -137,14 +150,23 @@
         $("result").style.display = "block";
         msg("");
       } else {
-        msg("ডাউনলোড শুরু হচ্ছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।");
-        window.location.href = serverUrl();
+        msg(inTelegram
+          ? "ব্রাউজারে ডাউনলোড খুলছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে।"
+          : "ডাউনলোড শুরু হচ্ছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।");
+        goDownload(serverUrl());
       }
     } catch (e) {
       msg(e.message, true);
     }
     setTimeout(() => { $("dlBtn").disabled = false; }, 4000);
   }
+
+  // Telegram-এর ভেতরে সরাসরি/সার্ভার লিংকের বাটনও মূল ব্রাউজারে খুলবে
+  ["directLink", "serverLink"].forEach(id => {
+    $(id).addEventListener("click", e => {
+      if (inTelegram) { e.preventDefault(); goDownload($(id).href); }
+    });
+  });
 </script>
 </body>
 </html>
