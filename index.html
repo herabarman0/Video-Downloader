@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ভিডিও ডাউনলোডার</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { --bg:#f4f6fb; --card:#fff; --text:#1c2230; --muted:#6b7385; --accent:#4f46e5; --err:#d93025; }
   @media (prefers-color-scheme: dark) {
@@ -15,19 +14,15 @@
   .card { width:100%; max-width:480px; background:var(--card); border-radius:16px; padding:22px; height:fit-content; box-shadow:0 4px 20px rgba(0,0,0,.08); }
   h1 { margin:0 0 4px; font-size:22px; }
   p.sub { margin:0 0 18px; color:var(--muted); font-size:14px; }
-  input, select, button, .btn { width:100%; font-size:16px; padding:13px; border-radius:10px; border:1px solid #8884; background:transparent; color:var(--text); font-family:inherit; }
+  input, select, button { width:100%; font-size:16px; padding:13px; border-radius:10px; border:1px solid #8884; background:transparent; color:var(--text); font-family:inherit; }
   select option { color:#000; }
   .row { margin-bottom:12px; }
-  button, .btn { background:var(--accent); color:#fff; border:none; font-weight:600; cursor:pointer; display:block; text-align:center; text-decoration:none; }
-  .btn.alt { background:transparent; color:var(--text); border:1px solid #8886; font-weight:500; }
+  button { background:var(--accent); color:#fff; border:none; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.6; }
   .preview { display:none; margin-bottom:12px; }
   .preview img { width:100%; border-radius:10px; }
   .preview .t { margin-top:8px; font-weight:600; font-size:15px; }
   .preview .m { color:var(--muted); font-size:13px; }
-  .result { display:none; margin-top:14px; padding:14px; border-radius:12px; background:#8881; font-size:14px; }
-  .result p { margin:0 0 10px; line-height:1.5; }
-  .result .btn { margin-bottom:8px; }
   #msg { margin-top:12px; font-size:14px; min-height:20px; word-break:break-word; }
   .err { color:var(--err); }
   .note { margin-top:16px; font-size:12px; color:var(--muted); }
@@ -60,12 +55,6 @@
     <button id="dlBtn" onclick="startDownload()">ডাউনলোড করুন</button>
   </div>
 
-  <div class="result" id="result">
-    <p>সরাসরি ডাউনলোড লিংক পাওয়া গেছে। নিচের বাটনে চাপলে ভিডিও ব্রাউজারে খুলবে। সেখান থেকে ব্রাউজারের মেনু (⋮) → <b>Download</b> চাপুন, বা ভিডিওতে লং-প্রেস করে <b>Save video</b> বেছে নিন।</p>
-    <a class="btn" id="directLink" href="#" target="_blank" rel="noopener noreferrer">সরাসরি ভিডিও খুলুন</a>
-    <a class="btn alt" id="serverLink" href="#">সরাসরি না চললে সার্ভার দিয়ে ডাউনলোড</a>
-  </div>
-
   <div id="msg"></div>
   <p class="note">শুধু নিজের বা ডাউনলোডের অনুমতি আছে এমন কনটেন্ট ডাউনলোড করুন। কপিরাইট ও সাইটের নিয়ম মানা আপনার দায়িত্ব।</p>
 </div>
@@ -77,28 +66,11 @@
 
   const $ = id => document.getElementById(id);
   const msg = (t, err) => { $("msg").textContent = t; $("msg").className = err ? "err" : ""; };
-  const errText = d => (d.error || "সমস্যা হয়েছে") + (d.detail ? " — " + d.detail : "");
-
-  // ---------- Telegram Mini App সাপোর্ট ----------
-  const TG = window.Telegram && window.Telegram.WebApp;
-  const inTelegram = !!(TG && TG.initData);
-  if (TG) { TG.ready(); TG.expand(); }
-
-  // Telegram-এর ভেতরে হলে ফোনের মূল ব্রাউজারে খুলবে, নইলে সাধারণভাবে
-  function goDownload(url) {
-    const full = new URL(url, location.href).href;
-    if (inTelegram) TG.openLink(full);
-    else window.location.href = full;
-  }
 
   function fmt(s) {
     if (!s) return "";
     const m = Math.floor(s / 60), sec = Math.floor(s % 60);
     return m + ":" + String(sec).padStart(2, "0");
-  }
-
-  function serverUrl() {
-    return API_BASE + "/api/download?url=" + encodeURIComponent($("url").value.trim()) + "&q=" + $("quality").value;
   }
 
   async function checkVideo() {
@@ -108,7 +80,6 @@
     msg("খোঁজা হচ্ছে... (প্রথমবার একটু সময় লাগতে পারে)");
     $("preview").style.display = "none";
     $("dlBox").style.display = "none";
-    $("result").style.display = "none";
     try {
       const r = await fetch(API_BASE + "/api/info", {
         method: "POST",
@@ -116,7 +87,7 @@
         body: JSON.stringify({ url })
       });
       const d = await r.json();
-      if (!r.ok) throw new Error(errText(d));
+      if (!r.ok) throw new Error((d.error || "সমস্যা হয়েছে") + (d.detail ? " — " + d.detail : ""));
       if (d.thumbnail) $("thumb").src = d.thumbnail;
       $("title").textContent = d.title;
       $("meta").textContent = [d.uploader, fmt(d.duration)].filter(Boolean).join(" • ");
@@ -129,44 +100,14 @@
     $("checkBtn").disabled = false;
   }
 
-  async function startDownload() {
-    const url = $("url").value.trim();
+  function startDownload() {
+    const url = encodeURIComponent($("url").value.trim());
     const q = $("quality").value;
-    $("result").style.display = "none";
+    msg("ডাউনলোড প্রস্তুত হচ্ছে, কিছুক্ষণ অপেক্ষা করুন। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।");
     $("dlBtn").disabled = true;
-    msg("প্রস্তুত হচ্ছে...");
-    try {
-      const r = await fetch(API_BASE + "/api/resolve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, q })
-      });
-      const d = await r.json();
-      if (!r.ok) throw new Error(errText(d));
-
-      if (d.mode === "direct") {
-        $("directLink").href = d.url;
-        $("serverLink").href = serverUrl();
-        $("result").style.display = "block";
-        msg("");
-      } else {
-        msg(inTelegram
-          ? "ব্রাউজারে ডাউনলোড খুলছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে।"
-          : "ডাউনলোড শুরু হচ্ছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।");
-        goDownload(serverUrl());
-      }
-    } catch (e) {
-      msg(e.message, true);
-    }
-    setTimeout(() => { $("dlBtn").disabled = false; }, 4000);
+    window.location.href = API_BASE + "/api/download?url=" + url + "&q=" + q;
+    setTimeout(() => { $("dlBtn").disabled = false; }, 15000);
   }
-
-  // Telegram-এর ভেতরে সরাসরি/সার্ভার লিংকের বাটনও মূল ব্রাউজারে খুলবে
-  ["directLink", "serverLink"].forEach(id => {
-    $(id).addEventListener("click", e => {
-      if (inTelegram) { e.preventDefault(); goDownload($(id).href); }
-    });
-  });
 </script>
 </body>
 </html>
