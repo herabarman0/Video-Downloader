@@ -187,36 +187,58 @@ def resolve():
     return jsonify(mode="server")
 
 
+def make_releaser(sem):
+    """স্লট একবারই ছাড়বে, যতবারই ডাকা হোক (ডাবল রিলিজ বা লিক ঠেকাতে)"""
+    state = {"done": False}
+    lock = threading.Lock()
+
+    def release():
+        with lock:
+            if state["done"]:
+                return
+            state["done"] = True
+        sem.release()
+
+    return release
+
+
 def try_pipe(info, direct_url):
     """ডিস্কে না রেখে সরাসরি ফোনে পাঠায়। ব্যর্থ হলে None"""
     if not PIPE_SLOTS.acquire(blocking=False):
         return error_page("সার্ভার এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
-    headers = dict(info.get("http_headers") or {})
-    headers.pop("Accept-Encoding", None)
+    release = make_releaser(PIPE_SLOTS)
+    r = None
     try:
+        headers = dict(info.get("http_headers") or {})
+        headers.pop("Accept-Encoding", None)
         r = requests.get(direct_url, headers=headers, stream=True, timeout=(10, 30))
-    except requests.RequestException:
-        PIPE_SLOTS.release()
-        return None
-    if r.status_code >= 400:
-        r.close()
-        PIPE_SLOTS.release()
-        return None
-
-    def gen():
-        try:
-            for chunk in r.iter_content(64 * 1024):
-                if chunk:
-                    yield chunk
-        finally:
+        if r.status_code >= 400:
             r.close()
-            PIPE_SLOTS.release()
+            release()
+            return None
 
-    resp = Response(gen(), content_type=r.headers.get("Content-Type", "application/octet-stream"))
-    if r.headers.get("Content-Length") and not r.headers.get("Content-Encoding"):
-        resp.headers["Content-Length"] = r.headers["Content-Length"]
-    resp.headers.set("Content-Disposition", "attachment", filename=make_filename(info))
-    return resp
+        def gen():
+            try:
+                for chunk in r.iter_content(64 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                r.close()
+                release()
+
+        resp = Response(gen(), content_type=r.headers.get("Content-Type", "application/octet-stream"))
+        if r.headers.get("Content-Length") and not r.headers.get("Content-Encoding"):
+            resp.headers["Content-Length"] = r.headers["Content-Length"]
+        resp.headers.set("Content-Disposition", "attachment", filename=make_filename(info))
+        # রেসপন্স যেভাবেই বন্ধ হোক (এমনকি জেনারেটর শুরুই না হলেও) স্লট ছাড়বে
+        resp.call_on_close(lambda: (r.close(), release()))
+        return resp
+    except Exception as e:
+        app.logger.error("pipe error: %s", e)
+        if r is not None:
+            r.close()
+        release()
+        return None
 
 
 def disk_download(url, quality):
@@ -257,6 +279,9 @@ def disk_download(url, quality):
 
 @app.route("/api/download")
 def download():
+    # ব্রাউজার/Telegram অনেক সময় আগে HEAD রিকোয়েস্ট পাঠায়, তাতে স্লট বা ডাউনলোড চালানো দরকার নেই
+    if request.method == "HEAD":
+        return Response(status=200, content_type="application/octet-stream")
     url = request.args.get("url", "").strip()
     quality = request.args.get("q", "best")
     if not valid_url(url) or quality not in FORMATS:
