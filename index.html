@@ -19,15 +19,22 @@
   select option { color:#000; }
   .row { margin-bottom:12px; }
   button, .btn { background:var(--accent); color:#fff; border:none; font-weight:600; cursor:pointer; display:block; text-align:center; text-decoration:none; }
-  .btn.alt { background:transparent; color:var(--text); border:1px solid #8886; font-weight:500; }
   button:disabled { opacity:.6; }
+
+  /* লিংক বক্স + এক ক্লিকে মোছার বাটন */
+  .input-wrap { position:relative; }
+  .input-wrap input { padding-right:46px; }
+  .clear { position:absolute; right:8px; top:50%; transform:translateY(-50%); width:32px; height:32px; padding:0; border-radius:50%; background:#8883; color:var(--text); font-size:18px; line-height:32px; display:none; }
+
+  /* ১৬:৯ প্রিভিউ, ফুল স্ক্রিন নয় */
   .preview { display:none; margin-bottom:12px; }
-  .preview img { width:100%; border-radius:10px; }
+  .preview .thumb { width:100%; aspect-ratio:16 / 9; background:#000; border-radius:10px; overflow:hidden; }
+  .preview .thumb img { width:100%; height:100%; object-fit:contain; display:block; }
   .preview .t { margin-top:8px; font-weight:600; font-size:15px; }
   .preview .m { color:var(--muted); font-size:13px; }
+
   .result { display:none; margin-top:14px; padding:14px; border-radius:12px; background:#8881; font-size:14px; }
   .result p { margin:0 0 10px; line-height:1.5; }
-  .result .btn { margin-bottom:8px; }
   #msg { margin-top:12px; font-size:14px; min-height:20px; word-break:break-word; }
   .err { color:var(--err); }
   .note { margin-top:16px; font-size:12px; color:var(--muted); }
@@ -38,11 +45,14 @@
   <h1>ভিডিও ডাউনলোডার</h1>
   <p class="sub">ভিডিওর লিংক পেস্ট করুন, ফোনে ডাউনলোড হবে</p>
 
-  <div class="row"><input id="url" type="url" inputmode="url" placeholder="ভিডিও লিংক এখানে পেস্ট করুন"></div>
+  <div class="row input-wrap">
+    <input id="url" type="url" inputmode="url" placeholder="ভিডিও লিংক এখানে পেস্ট করুন" oninput="toggleClear()">
+    <button class="clear" id="clearBtn" type="button" onclick="clearAll()" aria-label="মুছে ফেলুন">✕</button>
+  </div>
   <div class="row"><button id="checkBtn" onclick="checkVideo()">ভিডিও খুঁজুন</button></div>
 
   <div class="preview" id="preview">
-    <img id="thumb" alt="">
+    <div class="thumb"><img id="thumb" alt=""></div>
     <div class="t" id="title"></div>
     <div class="m" id="meta"></div>
   </div>
@@ -63,7 +73,6 @@
   <div class="result" id="result">
     <p>সরাসরি ডাউনলোড লিংক পাওয়া গেছে। নিচের বাটনে চাপলে ভিডিও ব্রাউজারে খুলবে। সেখান থেকে ব্রাউজারের মেনু (⋮) → <b>Download</b> চাপুন, বা ভিডিওতে লং-প্রেস করে <b>Save video</b> বেছে নিন।</p>
     <a class="btn" id="directLink" href="#" target="_blank" rel="noopener noreferrer">সরাসরি ভিডিও খুলুন</a>
-    <a class="btn alt" id="serverLink" href="#">সরাসরি না চললে সার্ভার দিয়ে ডাউনলোড</a>
   </div>
 
   <div id="msg"></div>
@@ -90,8 +99,7 @@
     return base + "." + ext;
   }
 
-  // Telegram-এর ভেতরে হলে Telegram-এর নিজস্ব ডাউনলোড (ব্রাউজারে না গিয়ে),
-  // পুরনো Telegram হলে মূল ব্রাউজারে, আর সাধারণ ব্রাউজারে সরাসরি
+  // Telegram-এর ভেতরে হলে Telegram-এর নিজস্ব ডাউনলোড, পুরনো Telegram হলে মূল ব্রাউজারে, সাধারণ ব্রাউজারে সরাসরি
   function goDownload(url) {
     const full = new URL(url, location.href).href;
     if (inTelegram) {
@@ -117,6 +125,24 @@
     return API_BASE + "/api/download?url=" + encodeURIComponent($("url").value.trim()) + "&q=" + $("quality").value;
   }
 
+  // ---------- লিংক মোছা ----------
+  function toggleClear() {
+    $("clearBtn").style.display = $("url").value ? "block" : "none";
+  }
+
+  function clearAll() {
+    $("url").value = "";
+    $("preview").style.display = "none";
+    $("dlBox").style.display = "none";
+    $("result").style.display = "none";
+    $("thumb").removeAttribute("src");
+    $("title").textContent = "";
+    $("meta").textContent = "";
+    msg("");
+    toggleClear();
+    $("url").focus();
+  }
+
   async function checkVideo() {
     const url = $("url").value.trim();
     if (!url) return msg("আগে লিংক দিন", true);
@@ -133,7 +159,7 @@
       });
       const d = await r.json();
       if (!r.ok) throw new Error(errText(d));
-      if (d.thumbnail) $("thumb").src = d.thumbnail;
+      if (d.thumbnail) $("thumb").src = d.thumbnail; else $("thumb").removeAttribute("src");
       $("title").textContent = d.title;
       $("meta").textContent = [d.uploader, fmt(d.duration)].filter(Boolean).join(" • ");
       $("preview").style.display = "block";
@@ -162,7 +188,6 @@
 
       if (d.mode === "direct") {
         $("directLink").href = d.url;
-        $("serverLink").href = serverUrl();
         $("result").style.display = "block";
         msg("");
       } else {
@@ -177,11 +202,9 @@
     setTimeout(() => { $("dlBtn").disabled = false; }, 4000);
   }
 
-  // Telegram-এর ভেতরে সরাসরি/সার্ভার লিংকের বাটনও মূল ব্রাউজারে খুলবে
-  ["directLink", "serverLink"].forEach(id => {
-    $(id).addEventListener("click", e => {
-      if (inTelegram) { e.preventDefault(); goDownload($(id).href); }
-    });
+  // Telegram-এর ভেতরে সরাসরি লিংকও মূল ব্রাউজারে খুলবে
+  $("directLink").addEventListener("click", e => {
+    if (inTelegram) { e.preventDefault(); goDownload($("directLink").href); }
   });
 </script>
 </body>
