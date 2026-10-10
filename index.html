@@ -1,675 +1,346 @@
-import hashlib
-import hmac
-import json
-import os
-import re
-import shutil
-import tempfile
-import threading
-import time
-import unicodedata
-import uuid
-from urllib.parse import parse_qsl, urlparse
-
-import requests
-import yt_dlp
-from flask import Flask, Response, jsonify, request, send_file, send_from_directory, after_this_request
-from flask_cors import CORS
-
-app = Flask(__name__, static_folder=".", static_url_path="")
-CORS(app)
-
-# ---------- সেটিংস (Render Environment-এ বদলানো যায়) ----------
-MAX_DURATION = int(os.environ.get("MAX_DURATION", 1800))          # সর্বোচ্চ ভিডিও দৈর্ঘ্য (সেকেন্ড)
-PIPE_SLOTS = threading.BoundedSemaphore(int(os.environ.get("MAX_PIPE", 4)))   # একসাথে কয়টা পাইপ ডাউনলোড
-DISK_SLOTS = threading.BoundedSemaphore(int(os.environ.get("MAX_DISK", 2)))   # একসাথে কয়টা ডিস্ক ডাউনলোড
-# যেসব সাইটে "সরাসরি লিংক" অপশন দেখানো হবে (ছোট হাতের নাম, কমা দিয়ে)
-DIRECT_EXTRACTORS = {
-    x.strip().lower()
-    for x in os.environ.get("DIRECT_EXTRACTORS", "twitter,facebook,vimeo").split(",")
-    if x.strip()
-}
-# YouTube-এর জন্য বিকল্প ক্লায়েন্ট
-YT_CLIENTS = [c.strip() for c in os.environ.get("YT_CLIENTS", "tv,web_safari,android_vr").split(",") if c.strip()]
-
-FORMATS = {
-    "best": "best[height<=720][ext=mp4]/best[height<=720]/best",
-    "720": "best[height<=720][ext=mp4]/best[height<=720]/best",
-    "480": "best[height<=480][ext=mp4]/best[height<=480]/best",
-    "360": "best[height<=360][ext=mp4]/best[height<=360]/best",
-    "audio": "bestaudio[ext=m4a]/bestaudio",
-}
-
-BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "socket_timeout": 30,
-    "retries": 3,
-    "extractor_args": {"youtube": {"player_client": YT_CLIENTS}},
-}
-
-
-# ---------- কুকি (ঐচ্ছিক) ----------
-def _has_cookies(path):
-    try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith("#HttpOnly_") or (not line.startswith("#") and "\t" in line):
-                    return True
-    except OSError:
-        pass
-    return False
-
-
-COOKIES_LOADED = False
-for _src in ("/etc/secrets/cookies.txt", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")):
-    if os.path.exists(_src) and _has_cookies(_src):
-        _dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        shutil.copyfile(_src, _dst)
-        BASE_OPTS["cookiefile"] = _dst
-        COOKIES_LOADED = True
-        break
-
-
-# ---------- সাহায্যকারী ----------
-def valid_url(url):
-    return isinstance(url, str) and url.startswith(("http://", "https://")) and len(url) < 2000
-
-
-# যেসব সাইট এই সার্ভারের IP ব্লক করে, সেগুলো আগেই থামিয়ে সুন্দর বার্তা দেখানো হয়।
-# ভবিষ্যতে প্রক্সি পেলে Render Environment-এ BLOCKED_SITES খালি করে দিলে আবার চালু হবে।
-BLOCKED_SITES = {
-    x.strip().lower()
-    for x in os.environ.get("BLOCKED_SITES", "youtube.com,youtu.be,tiktok.com").split(",")
-    if x.strip()
-}
-SITE_NAMES = {"youtube.com": "YouTube", "youtu.be": "YouTube", "tiktok.com": "TikTok"}
-
-
-def blocked_site(url):
-    host = (urlparse(url).hostname or "").lower()
-    for d in BLOCKED_SITES:
-        if host == d or host.endswith("." + d):
-            return SITE_NAMES.get(d, d)
-    return None
-
-
-UNSUPPORTED_MSG = "এই সাইটের ভিডিও এখন সাপোর্টেড নয়, তাই ডাউনলোড করা যাবে না। পরবর্তী আপডেটের জন্য অপেক্ষা করুন।"
-
-
-def blocked_message(name):
-    return UNSUPPORTED_MSG
-
-
-def friendly(e):
-    # আসল (লম্বা ইংরেজি) এরর Render-এর Logs-এ থাকে, ইউজারকে শুধু ছোট বার্তা দেখানো হয়
-    if "Private video" in str(e):
-        return "ভিডিওটা প্রাইভেট, ডাউনলোড করা যাবে না।"
-    return UNSUPPORTED_MSG
-
-
-def error_page(text, code):
-    html = (
-        '<!DOCTYPE html><html lang="bn"><head><meta charset="UTF-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>ত্রুটি</title></head>"
-        '<body style="font-family:system-ui,sans-serif;padding:24px;max-width:480px;margin:auto">'
-        f"<h3>ডাউনলোড হয়নি</h3><p>{text}</p>"
-        '<p><a href="/">← ফিরে যান</a></p></body></html>'
-    )
-    return html, code, {"Content-Type": "text/html; charset=utf-8"}
-
-
-def make_filename(info):
-    """নামে # ইমোজি ইত্যাদি থাকলে Android ফাইলের ধরন চিনতে পারে না, তাই শুধু অক্ষর/সংখ্যা রাখি"""
-    raw = info.get("title") or ""
-    # "32K views · 1.1K reactions |" জাতীয় শুরুর অংশ বাদ, বাকি অংশ " - " দিয়ে জোড়া
-    raw = re.sub(r"^\s*[\d.,]+\s*[KMBkmb]?\s*(views?|plays?|reactions?|likes?)\b[^|]*\|\s*", "", raw, flags=re.I)
-    raw = re.sub(r"\s*\|\s*", " - ", raw)
-    out = []
-    for ch in raw:
-        cat = unicodedata.category(ch)
-        if 0xFE00 <= ord(ch) <= 0xFE0F:
-            continue
-        out.append(ch if (cat[0] in "LNM" or ch in " ._-") else " ")
-    title = re.sub(r"\s+", " ", "".join(out)).strip(" .-")[:60].strip(" .-") or "video"
-    return f"{title}.{info.get('ext') or 'mp4'}"
-
-
-# ভিডিও তথ্য ৫ মিনিট মনে রাখে, যাতে একই ভিডিওতে বারবার খুঁজতে না হয়
-INFO_CACHE = {}
-INFO_LOCK = threading.Lock()
-
-
-def get_info(url, quality):
-    key = (url, quality)
-    now = time.time()
-    with INFO_LOCK:
-        hit = INFO_CACHE.get(key)
-        if hit and now - hit[0] < 300:
-            return hit[1]
-    opts = {**BASE_OPTS, "skip_download": True, "format": FORMATS[quality]}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.sanitize_info(ydl.extract_info(url, download=False))
-    if info.get("entries"):
-        info = info["entries"][0]
-    with INFO_LOCK:
-        if len(INFO_CACHE) >= 50:
-            INFO_CACHE.pop(min(INFO_CACHE, key=lambda k: INFO_CACHE[k][0]), None)
-        INFO_CACHE[key] = (now, info)
-    return info
-
-
-def single_http_url(info):
-    """একটাই ফাইল (ভিডিও+অডিও একসাথে) আর সরাসরি http(s) লিংক হলে সেই লিংক, নইলে None"""
-    if info.get("requested_formats"):
-        return None
-    u = info.get("url")
-    if not u or info.get("protocol") not in ("https", "http"):
-        return None
-    return u
-
-
-# ---------- প্রতি ইউজার (IP) সীমা ----------
-# খোঁজা: মিনিটে INFO_PER_MIN বার, ডাউনলোড: ১০ মিনিটে DL_PER_10MIN বার (Render Environment-এ বদলানো যায়)
-LIMITS = {
-    "info": (int(os.environ.get("INFO_PER_MIN", 10)), 60),
-    "dl": (int(os.environ.get("DL_PER_10MIN", 6)), 600),
-}
-RATE = {}
-RATE_LOCK = threading.Lock()
-
-
-def client_ip():
-    xff = request.headers.get("X-Forwarded-For", "")
-    return (xff.split(",")[0].strip() if xff else request.remote_addr) or "?"
-
-
-def rate_ok(kind):
-    limit, window = LIMITS[kind]
-    key = (client_ip(), kind)
-    now = time.time()
-    with RATE_LOCK:
-        stamps = [t for t in RATE.get(key, []) if now - t < window]
-        if len(stamps) >= limit:
-            RATE[key] = stamps
-            return False
-        stamps.append(now)
-        RATE[key] = stamps
-        if len(RATE) > 5000:  # মেমরি বাঁচাতে পুরনো এন্ট্রি ঝেড়ে ফেলা
-            for k in [k for k, v in RATE.items() if not v or now - v[-1] > 600]:
-                RATE.pop(k, None)
-    return True
-
-
-# ---------- রুট ----------
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
-
-
-@app.route("/health")
-def health():
-    return jsonify(
-        ok=True, yt_dlp=yt_dlp.version.__version__, cookies_loaded=COOKIES_LOADED,
-        yt_clients=YT_CLIENTS, direct=sorted(DIRECT_EXTRACTORS),
-    )
-
-
-@app.route("/api/info", methods=["POST"])
-def info_route():
-    url = (request.get_json(silent=True) or {}).get("url", "").strip()
-    if not valid_url(url):
-        return jsonify(error="সঠিক লিংক দিন"), 400
-    blocked = blocked_site(url)
-    if blocked:
-        return jsonify(error=blocked_message(blocked)), 400
-    if not rate_ok("info"):
-        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
-    try:
-        data = get_info(url, "best")
-        return jsonify(
-            title=data.get("title", "ভিডিও"),
-            thumbnail=data.get("thumbnail"),
-            duration=data.get("duration"),
-            uploader=data.get("uploader"),
-        )
-    except Exception as e:
-        app.logger.error("info error: %s", e)
-        return jsonify(error=friendly(e)), 400
-
-
-@app.route("/api/resolve", methods=["POST"])
-def resolve():
-    """সরাসরি লিংক দেওয়া যাবে কিনা বলে দেয়"""
-    body = request.get_json(silent=True) or {}
-    url = str(body.get("url", "")).strip()
-    quality = body.get("q", "best")
-    if not valid_url(url) or quality not in FORMATS:
-        return jsonify(error="ভুল অনুরোধ"), 400
-    blocked = blocked_site(url)
-    if blocked:
-        return jsonify(error=blocked_message(blocked)), 400
-    try:
-        info = get_info(url, quality)
-    except Exception as e:
-        app.logger.error("resolve error: %s", e)
-        return jsonify(error=friendly(e)), 400
-    if (info.get("duration") or 0) > MAX_DURATION:
-        return jsonify(error="ভিডিও অনেক বড়", detail="সর্বোচ্চ %d মিনিট" % (MAX_DURATION // 60)), 400
-    direct = single_http_url(info)
-    extractor = (info.get("extractor_key") or "").lower()
-    # ব্রাউজারে যেসব সাইট ঠিকমতো নামে না (যেমন Facebook, Instagram) সেগুলো Telegram বট দিয়ে নামবে
-    if BOT_TOKEN and any(extractor.startswith(s) for s in BOT_ONLY_SITES):
-        return jsonify(mode="bot", url=direct)
-    if direct and extractor in DIRECT_EXTRACTORS:
-        return jsonify(mode="direct", url=direct, filename=make_filename(info))
-    return jsonify(mode="server")
-
-
-def make_releaser(sem):
-    """স্লট একবারই ছাড়বে, যতবারই ডাকা হোক (ডাবল রিলিজ বা লিক ঠেকাতে)"""
-    state = {"done": False}
-    lock = threading.Lock()
-
-    def release():
-        with lock:
-            if state["done"]:
-                return
-            state["done"] = True
-        sem.release()
-
-    return release
-
-
-def try_pipe(info, direct_url):
-    """ডিস্কে না রেখে সরাসরি ফোনে পাঠায়। ব্যর্থ হলে None"""
-    if not PIPE_SLOTS.acquire(blocking=False):
-        return error_page("সার্ভার এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
-    release = make_releaser(PIPE_SLOTS)
-    r = None
-    try:
-        headers = dict(info.get("http_headers") or {})
-        headers.pop("Accept-Encoding", None)
-        r = requests.get(direct_url, headers=headers, stream=True, timeout=(10, 30))
-        if r.status_code >= 400:
-            r.close()
-            release()
-            return None
-
-        def gen():
-            try:
-                for chunk in r.iter_content(64 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
-                r.close()
-                release()
-
-        resp = Response(gen(), content_type=r.headers.get("Content-Type", "application/octet-stream"))
-        if r.headers.get("Content-Length") and not r.headers.get("Content-Encoding"):
-            resp.headers["Content-Length"] = r.headers["Content-Length"]
-        resp.headers.set("Content-Disposition", "attachment", filename=make_filename(info))
-        # রেসপন্স যেভাবেই বন্ধ হোক (এমনকি জেনারেটর শুরুই না হলেও) স্লট ছাড়বে
-        resp.call_on_close(lambda: (r.close(), release()))
-        return resp
-    except Exception as e:
-        app.logger.error("pipe error: %s", e)
-        if r is not None:
-            r.close()
-        release()
-        return None
-
-
-def disk_download(url, quality):
-    """পাইপ না চললে (যেমন ভিডিও-অডিও আলাদা, স্ট্রিম ফরম্যাট) অস্থায়ী ফাইলে নামিয়ে পাঠায়"""
-    if not DISK_SLOTS.acquire(blocking=False):
-        return error_page("সার্ভার এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
-    tmp = tempfile.mkdtemp()
-    try:
-        opts = {
-            **BASE_OPTS,
-            "format": FORMATS[quality],
-            "outtmpl": os.path.join(tmp, "video.%(ext)s"),
-            "match_filter": lambda info, **kw: (
-                "ভিডিও অনেক বড়" if (info.get("duration") or 0) > MAX_DURATION else None
-            ),
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        files = [f for f in os.listdir(tmp) if not f.endswith((".part", ".ytdl", ".temp"))]
-        if not files:
-            raise RuntimeError("ফাইল তৈরি হয়নি (ভিডিও খুব বড় হতে পারে)")
-        files.sort(key=lambda f: os.path.getsize(os.path.join(tmp, f)), reverse=True)
-        path = os.path.join(tmp, files[0])
-    except Exception as e:
-        app.logger.error("download error: %s", e)
-        shutil.rmtree(tmp, ignore_errors=True)
-        return error_page(friendly(e), 500)
-    finally:
-        DISK_SLOTS.release()
-
-    @after_this_request
-    def cleanup(response):
-        shutil.rmtree(tmp, ignore_errors=True)
-        return response
-
-    try:
-        base_info = get_info(url, quality)
-    except Exception:
-        base_info = {}
-    ext = os.path.splitext(files[0])[1].lstrip(".") or "mp4"
-    return send_file(path, as_attachment=True, download_name=make_filename({**base_info, "ext": ext}))
-
-
-@app.route("/api/download")
-def download():
-    # ব্রাউজার/Telegram অনেক সময় আগে HEAD রিকোয়েস্ট পাঠায়, তাতে স্লট বা ডাউনলোড চালানো দরকার নেই
-    if request.method == "HEAD":
-        return Response(status=200, content_type="application/octet-stream")
-    url = request.args.get("url", "").strip()
-    quality = request.args.get("q", "best")
-    if not valid_url(url) or quality not in FORMATS:
-        return error_page("ভুল অনুরোধ", 400)
-    blocked = blocked_site(url)
-    if blocked:
-        return error_page(blocked_message(blocked), 400)
-    if not rate_ok("dl"):
-        return error_page("অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
-    try:
-        info = get_info(url, quality)
-    except Exception as e:
-        app.logger.error("download info error: %s", e)
-        return error_page(friendly(e), 400)
-    if (info.get("duration") or 0) > MAX_DURATION:
-        return error_page("ভিডিও অনেক বড় (সর্বোচ্চ %d মিনিট)" % (MAX_DURATION // 60), 400)
-
-    direct = single_http_url(info)
-    if direct:
-        resp = try_pipe(info, direct)
-        if resp is not None:
-            return resp
-    return disk_download(url, quality)
-
-
-# ====================== Telegram বট ======================
-# লিংক পাঠালে বট লেখা ছাড়া শুধু ভিডিও পাঠায়। Render Environment-এ BOT_TOKEN ও BOT_WEBHOOK_SECRET দিলে চালু হয়।
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-BOT_WEBHOOK_SECRET = os.environ.get("BOT_WEBHOOK_SECRET", "").strip()
-SITE_URL = os.environ.get("SITE_URL", "").strip().rstrip("/")
-BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-BOT_MAX_BYTES = 49 * 1024 * 1024          # Bot API-তে ফাইল আপলোডের সীমা ~৫০ MB
-URL_RE = re.compile(r"https?://\S+")
-BOT_RATE = {}
-BOT_RATE_LOCK = threading.Lock()
-
-
-def tg_call(method, timeout=30, **kwargs):
-    try:
-        r = requests.post(f"{BOT_API}/{method}", timeout=timeout, **kwargs)
-        return r.json()
-    except Exception as e:
-        app.logger.error("telegram %s error: %s", method, e)
-        return {"ok": False}
-
-
-def tg_text(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_call("sendMessage", json=payload)
-
-
-def bot_rate_ok(chat_id, limit=6, window=600):
-    now = time.time()
-    with BOT_RATE_LOCK:
-        stamps = [t for t in BOT_RATE.get(chat_id, []) if now - t < window]
-        if len(stamps) >= limit:
-            BOT_RATE[chat_id] = stamps
-            return False
-        stamps.append(now)
-        BOT_RATE[chat_id] = stamps
-    return True
-
-
-def bot_download(url, tmp):
-    """৫০ MB-এর মধ্যে ফাইল পেতে আগে সেরা কোয়ালিটি, না পেলে 360p চেষ্টা করে। না পেলে None"""
-    for q in ("best", "360"):
-        for f in os.listdir(tmp):
-            os.remove(os.path.join(tmp, f))
-        opts = {
-            **BASE_OPTS,
-            "format": FORMATS[q],
-            "outtmpl": os.path.join(tmp, "video.%(ext)s"),
-            "max_filesize": BOT_MAX_BYTES,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        files = [f for f in os.listdir(tmp) if not f.endswith((".part", ".ytdl", ".temp"))]
-        if not files:
-            continue
-        path = os.path.join(tmp, max(files, key=lambda f: os.path.getsize(os.path.join(tmp, f))))
-        if os.path.getsize(path) <= BOT_MAX_BYTES:
-            return path
-    return None
-
-
-def bot_send_file(chat_id, url, info):
-    """সার্ভারে নামিয়ে Telegram-এ আপলোড (সরাসরি লিংক কাজ না করলে এই পথ)"""
-    if not DISK_SLOTS.acquire(blocking=False):
-        tg_text(chat_id, "সার্ভার এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
-        return
-    tmp = tempfile.mkdtemp()
-    try:
-        tg_call("sendChatAction", json={"chat_id": chat_id, "action": "upload_video"})
-        path = bot_download(url, tmp)
-        if not path:
-            tg_text(chat_id, "ভিডিওটা পাঠানো গেল না (ফাইল ৫০ MB-এর বেশি হতে পারে)।")
-            return
-        with open(path, "rb") as fh:
-            res = tg_call(
-                "sendVideo", timeout=300,
-                data={"chat_id": chat_id, "supports_streaming": "true"},
-                files={"video": (make_filename({**info, "ext": "mp4"}), fh)},
-            )
-        if not res.get("ok"):
-            app.logger.error("bot upload failed: %s", res)
-            tg_text(chat_id, "ভিডিও পাঠানো গেল না, পরে আবার চেষ্টা করুন।")
-    except Exception as e:
-        app.logger.error("bot download error: %s", e)
-        tg_text(chat_id, friendly(e))
-    finally:
-        DISK_SLOTS.release()
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def bot_handle(update):
-    try:
-        msg = update.get("message")
-        if not msg:
-            return
-        chat_id = msg["chat"]["id"]
-        text = (msg.get("text") or "").strip()
-
-        # ওয়েবসাইট থেকে আসা "Telegram-এ ভিডিও নিন" লিংক: /start <টোকেন>
-        if text.startswith("/start") and len(text.split(None, 1)) == 2:
-            link = bot_link_pop(text.split(None, 1)[1].strip())
-            if link:
-                bot_handle({"message": {"chat": {"id": chat_id}, "text": link}})
-                return
-
-        if text.startswith(("/start", "/help")):
-            markup = None
-            if SITE_URL:
-                markup = {"inline_keyboard": [[{"text": "ওয়েবসাইট খুলুন", "web_app": {"url": SITE_URL}}]]}
-            tg_text(chat_id, "ভিডিওর লিংক পাঠান, আমি শুধু ভিডিওটা পাঠিয়ে দেব।", markup)
-            return
-
-        m = URL_RE.search(text)
-        if not m:
-            tg_text(chat_id, "ভিডিওর লিংক পাঠান।")
-            return
-        url = m.group(0).rstrip(").,]>\"'")
-        if not valid_url(url):
-            tg_text(chat_id, "সঠিক লিংক দিন।")
-            return
-        blocked = blocked_site(url)
-        if blocked:
-            tg_text(chat_id, blocked_message(blocked))
-            return
-        if not bot_rate_ok(chat_id):
-            tg_text(chat_id, "অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
-            return
-
-        tg_call("sendChatAction", json={"chat_id": chat_id, "action": "upload_video"})
-        try:
-            info = get_info(url, "best")
-        except Exception as e:
-            app.logger.error("bot info error: %s", e)
-            tg_text(chat_id, friendly(e))
-            return
-        if (info.get("duration") or 0) > MAX_DURATION:
-            tg_text(chat_id, "ভিডিও অনেক বড় (সর্বোচ্চ %d মিনিট)।" % (MAX_DURATION // 60))
-            return
-
-        # ১) Telegram নিজেই লিংক থেকে ভিডিও টেনে নেয়, সার্ভারের ব্যান্ডউইথ লাগে না
-        direct = single_http_url(info)
-        if direct and (info.get("extractor_key") or "").lower() in DIRECT_EXTRACTORS:
-            res = tg_call("sendVideo", json={"chat_id": chat_id, "video": direct, "supports_streaming": True})
-            if res.get("ok"):
-                return
-            app.logger.info("bot url-send failed: %s", res)
-
-        # ২) না হলে সার্ভারে নামিয়ে আপলোড
-        bot_send_file(chat_id, url, info)
-    except Exception as e:
-        app.logger.error("bot handle error: %s", e)
-
-
-# ---------- ওয়েবসাইট থেকে বটে পাঠানো (যেসব সাইট ব্রাউজারে নামে না) ----------
-BOT_ONLY_SITES = {
-    x.strip().lower()
-    for x in os.environ.get("BOT_ONLY_SITES", "facebook,instagram").split(",")
-    if x.strip()
-}
-BOT_LINKS = {}            # টোকেন -> (সময়, লিংক)
-BOT_LINKS_LOCK = threading.Lock()
-_BOT_NAME = {"v": None}
-
-
-def bot_username():
-    if not _BOT_NAME["v"]:
-        res = tg_call("getMe")
-        _BOT_NAME["v"] = (res.get("result") or {}).get("username")
-    return _BOT_NAME["v"]
-
-
-def bot_link_new(url):
-    token = uuid.uuid4().hex[:16]
-    now = time.time()
-    with BOT_LINKS_LOCK:
-        for k in [k for k, (t, _) in BOT_LINKS.items() if now - t > 600]:
-            BOT_LINKS.pop(k, None)
-        BOT_LINKS[token] = (now, url)
-    return token
-
-
-def bot_link_pop(token):
-    with BOT_LINKS_LOCK:
-        item = BOT_LINKS.pop(token, None)
-    if item and time.time() - item[0] <= 600:
-        return item[1]
-    return None
-
-
-def tg_user_from_init_data(init_data):
-    """Mini App-এর initData যাচাই করে ইউজারের Telegram আইডি দেয়। ভুল হলে None"""
-    try:
-        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
-        got = pairs.pop("hash", "")
-        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-        if not got or not hmac.compare_digest(calc, got):
-            return None
-        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
-            return None
-        return json.loads(pairs["user"])["id"]
-    except Exception:
-        return None
-
-
-@app.route("/api/bot-send", methods=["POST"])
-def api_bot_send():
-    """Mini App-এর ভেতর থেকে: ভিডিও সরাসরি ইউজারের বট-চ্যাটে পাঠানো হয়"""
-    if not BOT_TOKEN:
-        return jsonify(error="বট চালু নেই"), 400
-    body = request.get_json(silent=True) or {}
-    url = str(body.get("url", "")).strip()
-    if not valid_url(url):
-        return jsonify(error="সঠিক লিংক দিন"), 400
-    chat_id = tg_user_from_init_data(str(body.get("init_data", "")))
-    if chat_id is None:
-        return jsonify(error="Telegram যাচাই হয়নি"), 403
-    blocked = blocked_site(url)
-    if blocked:
-        return jsonify(error=blocked_message(blocked)), 400
-    if not rate_ok("dl"):
-        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
-    threading.Thread(
-        target=bot_handle,
-        args=({"message": {"chat": {"id": chat_id}, "text": url}},),
-        daemon=True,
-    ).start()
-    return jsonify(ok=True)
-
-
-@app.route("/api/bot-link", methods=["POST"])
-def api_bot_link():
-    """সাধারণ ব্রাউজারে: বটের একটা লিংক দেয়, Start চাপলেই ভিডিও আসে"""
-    if not BOT_TOKEN:
-        return jsonify(error="বট চালু নেই"), 400
-    url = str((request.get_json(silent=True) or {}).get("url", "")).strip()
-    if not valid_url(url):
-        return jsonify(error="সঠিক লিংক দিন"), 400
-    blocked = blocked_site(url)
-    if blocked:
-        return jsonify(error=blocked_message(blocked)), 400
-    if not rate_ok("dl"):
-        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
-    name = bot_username()
-    if not name:
-        return jsonify(error="বট খুঁজে পাওয়া যায়নি"), 500
-    return jsonify(link=f"https://t.me/{name}?start={bot_link_new(url)}")
-
-
-@app.route("/tg/webhook", methods=["POST"])
-def tg_webhook():
-    if not BOT_TOKEN:
-        return "bot off", 404
-    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not BOT_WEBHOOK_SECRET or not hmac.compare_digest(got, BOT_WEBHOOK_SECRET):
-        return "forbidden", 403
-    update = request.get_json(silent=True) or {}
-    threading.Thread(target=bot_handle, args=(update,), daemon=True).start()
-    return "ok"
-
-
-@app.route("/tg/set-webhook")
-def tg_set_webhook():
-    """একবার খুললেই Telegram-কে এই সার্ভারের ঠিকানা জানিয়ে দেয়"""
-    if not BOT_TOKEN or not BOT_WEBHOOK_SECRET:
-        return "BOT_TOKEN ও BOT_WEBHOOK_SECRET সেট করুন", 400
-    if not hmac.compare_digest(request.args.get("key", ""), BOT_WEBHOOK_SECRET):
-        return "forbidden", 403
-    res = tg_call("setWebhook", json={
-        "url": f"https://{request.host}/tg/webhook",
-        "secret_token": BOT_WEBHOOK_SECRET,
-        "allowed_updates": ["message"],
-    })
-    return jsonify(res)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), threaded=True)
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ভিডিও ডাউনলোডার</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg:#f4f6fb; --card:#fff; --text:#1c2230; --muted:#6b7385; --accent:#4f46e5; --err:#d93025; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1220; --card:#181c2e; --text:#e8ebf5; --muted:#99a1b8; --accent:#7c75ff; --err:#ff6b6b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Noto Sans Bengali",system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; min-height:100dvh; display:flex; padding:20px; }
+  /* margin:auto = শুরুতে পর্দার মাঝখানে, কনটেন্ট বাড়লে কার্ড নিজে বড় হবে */
+  .card { width:100%; max-width:480px; margin:auto; background:var(--card); border-radius:16px; padding:22px; height:fit-content; box-shadow:0 4px 20px rgba(0,0,0,.08); }
+  h1 { margin:0 0 4px; font-size:22px; }
+  p.sub { margin:0 0 18px; color:var(--muted); font-size:14px; }
+  input, select, button, .btn { width:100%; font-size:16px; padding:13px; border-radius:10px; border:1px solid #8884; background:transparent; color:var(--text); font-family:inherit; }
+  select option { color:#000; }
+  .row { margin-bottom:12px; }
+  button, .btn { background:var(--accent); color:#fff; border:none; font-weight:600; cursor:pointer; display:block; text-align:center; text-decoration:none; }
+  button:disabled { opacity:.6; }
+
+  /* লিংক বক্স + এক ক্লিকে মোছার বাটন */
+  .input-wrap { position:relative; }
+  .input-wrap input { padding-right:46px; }
+  .clear { position:absolute; right:8px; top:50%; transform:translateY(-50%); width:32px; height:32px; padding:0; border-radius:50%; background:#8883; color:var(--text); font-size:18px; line-height:32px; display:none; }
+
+  /* শুধু ভিডিও মোড: ১৬:৯ বক্স, কোনো লেখা নেই (টাইটেল শুধু ফাইলের নামের জন্য লুকানো থাকে) */
+  .preview { display:none; margin-bottom:12px; }
+  .preview .thumb { width:100%; aspect-ratio:16 / 9; background:#000; border-radius:10px; overflow:hidden; }
+  .preview .thumb img { width:100%; height:100%; object-fit:contain; display:block; }
+  .preview .thumb video { display:none; width:100%; height:100%; object-fit:contain; background:#000; }
+  .preview .t, .preview .m { display:none; }
+
+  .result { display:none; margin-top:14px; padding:14px; border-radius:12px; background:#8881; font-size:14px; }
+  .result p { margin:0 0 10px; line-height:1.5; }
+  #msg { margin-top:12px; font-size:14px; min-height:20px; word-break:break-word; }
+  .err { color:var(--err); }
+  .note { margin-top:16px; font-size:12px; color:var(--muted); }
+
+  /* ফুটার: নাম + সোশ্যাল আইকন */
+  .footer { margin-top:14px; padding-top:14px; border-top:1px solid #8883; text-align:center; font-size:12px; color:var(--muted); }
+  .footer .icons { display:flex; justify-content:center; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .footer .icons a { display:inline-flex; align-items:center; justify-content:center; width:36px; height:36px; border-radius:50%; border:1px solid #8884; color:var(--muted); text-decoration:none; }
+  .footer .icons a:active, .footer .icons a:hover { color:var(--accent); border-color:var(--accent); }
+  .footer .sep { width:1px; height:20px; background:#8884; margin:0 2px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>ভিডিও ডাউনলোডার</h1>
+  <p class="sub">ভিডিওর লিংক পেস্ট করুন, ফোনে ডাউনলোড হবে</p>
+
+  <div class="row input-wrap">
+    <input id="url" type="url" inputmode="url" placeholder="ভিডিও লিংক এখানে পেস্ট করুন" oninput="toggleClear()">
+    <button class="clear" id="clearBtn" type="button" onclick="clearAll()" aria-label="মুছে ফেলুন">✕</button>
+  </div>
+  <div class="row"><button id="checkBtn" onclick="checkVideo()">ভিডিও খুঁজুন</button></div>
+
+  <div class="preview" id="preview">
+    <div class="thumb">
+      <img id="thumb" alt="">
+      <video id="player" controls playsinline preload="metadata"></video>
+    </div>
+    <div class="t" id="title"></div>
+    <div class="m" id="meta"></div>
+  </div>
+
+  <div id="dlBox" style="display:none">
+    <div class="row">
+      <select id="quality">
+        <option value="best">সেরা কোয়ালিটি</option>
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="audio">শুধু অডিও</option>
+      </select>
+    </div>
+    <button id="dlBtn" onclick="startDownload()">ডাউনলোড করুন</button>
+  </div>
+
+  <div class="result" id="result">
+    <p id="resultText"></p>
+    <a class="btn" id="directLink" href="#" target="_blank" rel="noopener noreferrer"></a>
+  </div>
+
+  <div id="msg"></div>
+  <p class="note">শুধু নিজের বা ডাউনলোডের অনুমতি আছে এমন কনটেন্ট ডাউনলোড করুন। কপিরাইট ও সাইটের নিয়ম মানা আপনার দায়িত্ব।</p>
+
+  <div class="footer">
+    <div>© <span id="yr">2026</span> Hera Barman</div>
+    <div class="icons">
+      <a href="https://www.tiktok.com/@luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="TikTok" title="TikTok">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M16.6 3c.3 2.3 1.7 3.9 4 4.1v3.1c-1.5 0-2.9-.5-4-1.3v6.4a6.1 6.1 0 1 1-6.1-6.1c.3 0 .6 0 .9.1v3.2a2.9 2.9 0 1 0 2 2.8V3h3.2z"/></svg>
+      </a>
+      <a href="https://www.youtube.com/@luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="YouTube" title="YouTube">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M21.6 7.2a2.5 2.5 0 0 0-1.8-1.8C18.2 5 12 5 12 5s-6.2 0-7.8.4A2.5 2.5 0 0 0 2.4 7.2C2 8.8 2 12 2 12s0 3.2.4 4.8a2.5 2.5 0 0 0 1.8 1.8C5.8 19 12 19 12 19s6.2 0 7.8-.4a2.5 2.5 0 0 0 1.8-1.8c.4-1.6.4-4.8.4-4.8s0-3.2-.4-4.8zM10 15V9l5.2 3L10 15z"/></svg>
+      </a>
+      <a href="https://www.instagram.com/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Instagram" title="Instagram">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>
+      </a>
+      <a href="https://t.me/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Telegram" title="Telegram">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M21.9 3.6 2.7 11c-.9.4-.9 1.1-.2 1.3l4.9 1.5 1.9 5.8c.2.6.4.8.8.8.4 0 .6-.2.9-.5l2.4-2.3 4.9 3.6c.9.5 1.5.2 1.7-.8L23 4.7c.3-1.2-.4-1.7-1.1-1.1zM9 14.2l9.2-5.8c.4-.3.8-.1.5.2l-7.6 6.9-.3 3.2L9 14.2z"/></svg>
+      </a>
+      <a href="https://www.facebook.com/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Facebook" title="Facebook">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M13.5 21v-8h2.7l.4-3.2h-3.1V7.8c0-.9.3-1.5 1.6-1.5h1.7V3.4c-.3 0-1.3-.1-2.4-.1-2.4 0-4.1 1.5-4.1 4.2v2.3H7.6V13h2.7v8h3.2z"/></svg>
+      </a>
+      <span class="sep"></span>
+      <a href="https://github.com/herabarman0" target="_blank" rel="noopener noreferrer" aria-label="GitHub" title="GitHub">
+        <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+    </div>
+  </div>
+</div>
+
+<script>
+  // একই Render সার্ভার থেকে সাইট চালালে খালি রাখুন।
+  // আলাদা জায়গায় রাখলে শেষে "/" ছাড়া লিংক দিন, যেমন: "https://downloader-yu1r.onrender.com"
+  const API_BASE = "";
+
+  const $ = id => document.getElementById(id);
+  const msg = (t, err) => { $("msg").textContent = t; $("msg").className = err ? "err" : ""; };
+  const errText = d => (d.error || "সমস্যা হয়েছে") + (d.detail ? " — " + d.detail : "");
+
+  // ---------- Telegram Mini App সাপোর্ট ----------
+  const TG = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(TG && TG.initData);
+  if (TG) { TG.ready(); TG.expand(); }
+
+  // ফাইলের নাম: শুরুর "32K views · 1.1K reactions |" বাদ, # ইমোজি ইত্যাদি বাদ
+  function fileName() {
+    const ext = $("quality").value === "audio" ? "m4a" : "mp4";
+    const base = ($("title").textContent || "")
+      .replace(/^\s*[\d.,]+\s*[KMBkmb]?\s*(views?|plays?|reactions?|likes?)\b[^|]*\|\s*/i, "")
+      .replace(/\s*\|\s*/g, " - ")
+      .replace(/[\uFE00-\uFE0F]/g, "")
+      .replace(/[^\p{L}\p{N}\p{M} ._-]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[. -]+|[. -]+$/g, "")
+      .slice(0, 60)
+      .trim();
+    return (base || "video") + "." + ext;
+  }
+
+  // Telegram-এর ভেতরে হলে Telegram-এর নিজস্ব ডাউনলোড, পুরনো Telegram হলে মূল ব্রাউজারে, সাধারণ ব্রাউজারে সরাসরি
+  function goDownload(url) {
+    const full = new URL(url, location.href).href;
+    if (inTelegram) {
+      if (TG.downloadFile && TG.isVersionAtLeast && TG.isVersionAtLeast("8.0")) {
+        TG.downloadFile({ url: full, file_name: fileName() }, ok => {
+          msg(ok ? "ডাউনলোড শুরু হয়েছে, Telegram-এর ডাউনলোড দেখুন।" : "ডাউনলোড বাতিল হয়েছে।");
+        });
+      } else {
+        TG.openLink(full);
+      }
+    } else {
+      window.location.href = full;
+    }
+  }
+
+  function serverUrl() {
+    return API_BASE + "/api/download?url=" + encodeURIComponent($("url").value.trim()) + "&q=" + $("quality").value;
+  }
+
+  // ---------- শুধু ভিডিও মোড ----------
+  // সরাসরি লিংক আছে এমন সাইটে (Facebook, Twitter/X, Vimeo) ছবির জায়গায় সরাসরি ভিডিও প্লেয়ার আসে।
+  // ভিডিও সোর্স সাইট থেকে ফোনে আসে, সার্ভারের ব্যান্ডউইথ লাগে না। বাকি সাইটে ছবিই থাকে।
+  function resetPlayer() {
+    const v = $("player");
+    v.onerror = null;
+    v.pause();
+    v.removeAttribute("src");
+    v.removeAttribute("poster");
+    v.load();
+    v.style.display = "none";
+    $("thumb").style.display = "";
+  }
+
+  async function prepareVideo(url) {
+    try {
+      const r = await fetch(API_BASE + "/api/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, q: "best" })
+      });
+      const d = await r.json();
+      if (!r.ok || !d.url) return;
+      if ($("url").value.trim() !== url) return;   // ইতিমধ্যে অন্য লিংক দেওয়া হলে বাদ
+      const v = $("player");
+      v.onerror = () => { if (v.getAttribute("src")) resetPlayer(); };
+      const poster = $("thumb").getAttribute("src");
+      if (poster) v.poster = poster;
+      v.src = d.url;
+      v.style.display = "block";
+      $("thumb").style.display = "none";
+    } catch (e) { /* ছবিই থাকবে */ }
+  }
+
+  // ---------- লিংক মোছা ----------
+  function toggleClear() {
+    $("clearBtn").style.display = $("url").value ? "block" : "none";
+  }
+
+  function clearAll() {
+    $("url").value = "";
+    $("preview").style.display = "none";
+    $("dlBox").style.display = "none";
+    $("result").style.display = "none";
+    resetPlayer();
+    $("thumb").removeAttribute("src");
+    $("title").textContent = "";
+    $("meta").textContent = "";
+    msg("");
+    toggleClear();
+    $("url").focus();
+  }
+
+  async function checkVideo() {
+    const url = $("url").value.trim();
+    if (!url) return msg("আগে লিংক দিন", true);
+    $("checkBtn").disabled = true;
+    msg("খোঁজা হচ্ছে... (প্রথমবার একটু সময় লাগতে পারে)");
+    $("preview").style.display = "none";
+    $("dlBox").style.display = "none";
+    $("result").style.display = "none";
+    resetPlayer();
+    try {
+      const r = await fetch(API_BASE + "/api/info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(errText(d));
+      if (d.thumbnail) $("thumb").src = d.thumbnail; else $("thumb").removeAttribute("src");
+      $("title").textContent = d.title || "";
+      $("meta").textContent = "";
+      $("preview").style.display = "block";
+      $("dlBox").style.display = "block";
+      msg("");
+      prepareVideo(url);
+    } catch (e) {
+      msg(e.message, true);
+    }
+    $("checkBtn").disabled = false;
+  }
+
+  // ---------- ফলাফল বক্স (সরাসরি লিংক / বটের লিংক) ----------
+  const FILE_TEXT = "সরাসরি ডাউনলোড লিংক পাওয়া গেছে। নিচের বাটনে চাপলে ভিডিও ব্রাউজারে খুলবে। সেখান থেকে ব্রাউজারের মেনু (⋮) → Download চাপুন, বা ভিডিওতে লং-প্রেস করে Save video বেছে নিন।";
+  const BOT_TEXT = "ভিডিওটা Telegram বটের মাধ্যমে পাবেন। নিচের বাটনে চাপলে Telegram খুলবে, Start চাপলেই ভিডিও চলে আসবে।";
+
+  function showResult(kind, href) {
+    const a = $("directLink");
+    a.href = href;
+    a.dataset.kind = kind;
+    a.textContent = kind === "bot" ? "Telegram-এ ভিডিও নিন" : "সরাসরি ভিডিও খুলুন";
+    $("resultText").textContent = kind === "bot" ? BOT_TEXT : FILE_TEXT;
+    $("result").style.display = "block";
+  }
+
+  // ব্রাউজারে যে সাইটের ভিডিও ঠিকমতো নামে না (যেমন Facebook, Instagram) সেগুলো বটের মাধ্যমে আসে
+  async function sendViaBot(url) {
+    // Telegram-এর ভেতরে: ভিডিও সরাসরি চ্যাটে চলে আসে, ইউজারকে আলাদা কিছু করতে হয় না
+    if (inTelegram) {
+      const r = await fetch(API_BASE + "/api/bot-send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, init_data: TG.initData })
+      });
+      if (r.ok) {
+        msg("ডাউনলোড শুরু হচ্ছে...");
+        setTimeout(() => TG.close(), 1200);
+        return;
+      }
+    }
+    // সাধারণ ব্রাউজারে: বটের লিংক, Start চাপলেই ভিডিও আসে
+    const r2 = await fetch(API_BASE + "/api/bot-link", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const d2 = await r2.json();
+    if (!r2.ok) throw new Error(errText(d2));
+    showResult("bot", d2.link);
+    msg("");
+  }
+
+  async function startDownload() {
+    const url = $("url").value.trim();
+    const q = $("quality").value;
+    $("result").style.display = "none";
+    $("dlBtn").disabled = true;
+    msg("প্রস্তুত হচ্ছে...");
+    try {
+      const r = await fetch(API_BASE + "/api/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, q })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(errText(d));
+
+      if (d.mode === "bot") {
+        await sendViaBot(url);
+      } else if (d.mode === "direct") {
+        showResult("file", d.url);
+        msg("");
+      } else {
+        msg(inTelegram
+          ? "ডাউনলোডের অনুমতি চাওয়া হচ্ছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে।"
+          : "ডাউনলোড শুরু হচ্ছে। বড় ভিডিওতে কয়েক মিনিট লাগতে পারে, পেজ বন্ধ করবেন না।");
+        goDownload(serverUrl());
+      }
+    } catch (e) {
+      msg(e.message, true);
+    }
+    setTimeout(() => { $("dlBtn").disabled = false; }, 4000);
+  }
+
+  // Telegram-এর ভেতরে সরাসরি লিংকও মূল ব্রাউজারে খুলবে
+  $("directLink").addEventListener("click", e => {
+    if (!inTelegram) return;
+    e.preventDefault();
+    const a = $("directLink");
+    if (a.dataset.kind === "bot" && TG.openTelegramLink) TG.openTelegramLink(a.href);
+    else goDownload(a.href);
+  });
+
+  // Telegram-এর ভেতরে ফুটারের সোশ্যাল লিংক ঠিকমতো খোলার জন্য
+  document.querySelectorAll(".footer .icons a").forEach(a => {
+    a.addEventListener("click", e => {
+      if (!inTelegram) return;
+      e.preventDefault();
+      if (a.href.startsWith("https://t.me/") && TG.openTelegramLink) TG.openTelegramLink(a.href);
+      else TG.openLink(a.href);
+    });
+  });
+
+  // ফুটারে বছর নিজে থেকে বদলাবে
+  $("yr").textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
