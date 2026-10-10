@@ -93,10 +93,17 @@
   const inTelegram = !!(TG && TG.initData);
   if (TG) { TG.ready(); TG.expand(); }
 
+  // নামে # ইমোজি ইত্যাদি থাকলে Android ফাইলের ধরন চিনতে পারে না, তাই শুধু অক্ষর/সংখ্যা রাখি
   function fileName() {
     const ext = $("quality").value === "audio" ? "m4a" : "mp4";
-    const base = ($("title").textContent || "video").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) || "video";
-    return base + "." + ext;
+    const base = ($("title").textContent || "")
+      .replace(/[\uFE00-\uFE0F]/g, "")
+      .replace(/[^\p{L}\p{N}\p{M} ._-]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[. ]+|[. ]+$/g, "")
+      .slice(0, 60)
+      .trim();
+    return (base || "video") + "." + ext;
   }
 
   // Telegram-এর ভেতরে হলে Telegram-এর নিজস্ব ডাউনলোড, পুরনো Telegram হলে মূল ব্রাউজারে, সাধারণ ব্রাউজারে সরাসরি
