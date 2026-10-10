@@ -224,6 +224,8 @@ def info_route():
         return jsonify(error="সঠিক লিংক দিন"), 400
     blocked = blocked_site(url)
     if blocked:
+        if WORKER_KEY:   # ফোন-ওয়ার্কার দিয়ে নামবে, এখানে প্রিভিউ আনা যায় না
+            return jsonify(title="", thumbnail=None, no_preview=True)
         return jsonify(error=blocked_message(blocked)), 400
     if not rate_ok("info"):
         return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
@@ -250,6 +252,8 @@ def resolve():
         return jsonify(error="ভুল অনুরোধ"), 400
     blocked = blocked_site(url)
     if blocked:
+        if WORKER_KEY:
+            return jsonify(mode="bot", url=None)
         return jsonify(error=blocked_message(blocked)), 400
     try:
         info = get_info(url, quality)
@@ -421,6 +425,12 @@ def tg_text(chat_id, text, reply_markup=None):
     return tg_call("sendMessage", json=payload)
 
 
+def bot_cleanup(chat_id, msg_id):
+    """ভিডিও পাঠানো হয়ে গেলে ইউজারের পাঠানো লিংকের মেসেজটা মুছে দেয়, চ্যাটে শুধু ভিডিও থাকে"""
+    if msg_id:
+        tg_call("deleteMessage", json={"chat_id": chat_id, "message_id": msg_id})
+
+
 def bot_rate_ok(chat_id, limit=6, window=600):
     now = time.time()
     with BOT_RATE_LOCK:
@@ -476,9 +486,12 @@ def bot_send_file(chat_id, url, info):
         if not res.get("ok"):
             app.logger.error("bot upload failed: %s", res)
             tg_text(chat_id, "ভিডিও পাঠানো গেল না, পরে আবার চেষ্টা করুন।")
+            return False
+        return True
     except Exception as e:
         app.logger.error("bot download error: %s", e)
         tg_text(chat_id, friendly(e))
+        return False
     finally:
         DISK_SLOTS.release()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -490,6 +503,7 @@ def bot_handle(update):
         if not msg:
             return
         chat_id = msg["chat"]["id"]
+        msg_id = msg.get("message_id")
         text = (msg.get("text") or "").strip()
 
         # ওয়েবসাইট থেকে আসা "Telegram-এ ভিডিও নিন" লিংক: /start <টোকেন>
@@ -516,7 +530,15 @@ def bot_handle(update):
             return
         blocked = blocked_site(url)
         if blocked:
-            tg_text(chat_id, blocked_message(blocked))
+            if WORKER_KEY:
+                if not bot_rate_ok(chat_id):
+                    tg_text(chat_id, "অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+                elif not worker_online():
+                    tg_text(chat_id, blocked_message(blocked))   # ফোন-ওয়ার্কার বন্ধ
+                else:
+                    worker_enqueue(chat_id, url)
+            else:
+                tg_text(chat_id, blocked_message(blocked))
             return
         if not bot_rate_ok(chat_id):
             tg_text(chat_id, "অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
@@ -538,19 +560,55 @@ def bot_handle(update):
         if direct and (info.get("extractor_key") or "").lower() in DIRECT_EXTRACTORS:
             res = tg_call("sendVideo", json={"chat_id": chat_id, "video": direct, "supports_streaming": True})
             if res.get("ok"):
+                bot_cleanup(chat_id, msg_id)
                 return
             app.logger.info("bot url-send failed: %s", res)
 
         # ২) না হলে সার্ভারে নামিয়ে আপলোড
-        bot_send_file(chat_id, url, info)
+        if bot_send_file(chat_id, url, info):
+            bot_cleanup(chat_id, msg_id)
     except Exception as e:
         app.logger.error("bot handle error: %s", e)
+
+
+# ---------- ফোন-ওয়ার্কার (YouTube/TikTok-এর জন্য) ----------
+# এই সার্ভারের IP-কে YouTube/TikTok আটকায়। তাই ওই লিংকের কাজ আপনার নিজের ফোনের Termux-এ চলা worker.py-কে দেওয়া হয়।
+# ফোন প্রতি কয়েক সেকেন্ডে এখানে জিজ্ঞেস করে (/worker/next), কাজ পেলে ভিডিও নামিয়ে সরাসরি Telegram-এ পাঠায়।
+WORKER_KEY = os.environ.get("WORKER_KEY", "").strip()
+JOBS_Q = []
+JOBS_LOCK = threading.Lock()
+WORKER_SEEN = {"t": 0.0}
+
+
+def worker_online():
+    return time.time() - WORKER_SEEN["t"] < 30
+
+
+def worker_enqueue(chat_id, url):
+    now = time.time()
+    with JOBS_LOCK:
+        JOBS_Q[:] = [j for j in JOBS_Q if now - j["t"] < 600]
+        JOBS_Q.append({"id": uuid.uuid4().hex[:10], "chat_id": chat_id, "url": url, "t": now})
+    tg_call("sendChatAction", json={"chat_id": chat_id, "action": "upload_video"})
+
+
+@app.route("/worker/next")
+def worker_next():
+    got = request.headers.get("X-Worker-Key", "")
+    if not WORKER_KEY or not hmac.compare_digest(got, WORKER_KEY):
+        return "forbidden", 403
+    WORKER_SEEN["t"] = time.time()
+    now = time.time()
+    with JOBS_LOCK:
+        JOBS_Q[:] = [j for j in JOBS_Q if now - j["t"] < 600]
+        job = JOBS_Q.pop(0) if JOBS_Q else None
+    return jsonify(job=job)
 
 
 # ---------- ওয়েবসাইট থেকে বটে পাঠানো (যেসব সাইট ব্রাউজারে নামে না) ----------
 BOT_ONLY_SITES = {
     x.strip().lower()
-    for x in os.environ.get("BOT_ONLY_SITES", "facebook,instagram").split(",")
+    for x in os.environ.get("BOT_ONLY_SITES", "").split(",")
     if x.strip()
 }
 BOT_LINKS = {}            # টোকেন -> (সময়, লিংক)
@@ -613,7 +671,7 @@ def api_bot_send():
     if chat_id is None:
         return jsonify(error="Telegram যাচাই হয়নি"), 403
     blocked = blocked_site(url)
-    if blocked:
+    if blocked and not WORKER_KEY:
         return jsonify(error=blocked_message(blocked)), 400
     if not rate_ok("dl"):
         return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
@@ -634,7 +692,7 @@ def api_bot_link():
     if not valid_url(url):
         return jsonify(error="সঠিক লিংক দিন"), 400
     blocked = blocked_site(url)
-    if blocked:
+    if blocked and not WORKER_KEY:
         return jsonify(error=blocked_message(blocked)), 400
     if not rate_ok("dl"):
         return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
