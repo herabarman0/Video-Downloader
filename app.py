@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 
 import requests
 import yt_dlp
@@ -27,7 +28,7 @@ DIRECT_EXTRACTORS = {
 YT_CLIENTS = [c.strip() for c in os.environ.get("YT_CLIENTS", "tv,web_safari,android_vr").split(",") if c.strip()]
 
 FORMATS = {
-    "best": "best[ext=mp4]/best",
+    "best": "best[height<=720][ext=mp4]/best[height<=720]/best",
     "720": "best[height<=720][ext=mp4]/best[height<=720]/best",
     "480": "best[height<=480][ext=mp4]/best[height<=480]/best",
     "360": "best[height<=360][ext=mp4]/best[height<=360]/best",
@@ -95,7 +96,14 @@ def error_page(text, code):
 
 
 def make_filename(info):
-    title = re.sub(r'[\\/:*?"<>|\r\n]+', " ", info.get("title") or "video").strip()[:80] or "video"
+    """নামে # ইমোজি ইত্যাদি থাকলে Android ফাইলের ধরন চিনতে পারে না, তাই শুধু অক্ষর/সংখ্যা রাখি"""
+    out = []
+    for ch in info.get("title") or "":
+        cat = unicodedata.category(ch)
+        if 0xFE00 <= ord(ch) <= 0xFE0F:
+            continue
+        out.append(ch if (cat[0] in "LNM" or ch in " ._-") else " ")
+    title = re.sub(r"\s+", " ", "".join(out)).strip(" .")[:60].strip() or "video"
     return f"{title}.{info.get('ext') or 'mp4'}"
 
 
@@ -133,6 +141,38 @@ def single_http_url(info):
     return u
 
 
+# ---------- প্রতি ইউজার (IP) সীমা ----------
+# খোঁজা: মিনিটে INFO_PER_MIN বার, ডাউনলোড: ১০ মিনিটে DL_PER_10MIN বার (Render Environment-এ বদলানো যায়)
+LIMITS = {
+    "info": (int(os.environ.get("INFO_PER_MIN", 10)), 60),
+    "dl": (int(os.environ.get("DL_PER_10MIN", 6)), 600),
+}
+RATE = {}
+RATE_LOCK = threading.Lock()
+
+
+def client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    return (xff.split(",")[0].strip() if xff else request.remote_addr) or "?"
+
+
+def rate_ok(kind):
+    limit, window = LIMITS[kind]
+    key = (client_ip(), kind)
+    now = time.time()
+    with RATE_LOCK:
+        stamps = [t for t in RATE.get(key, []) if now - t < window]
+        if len(stamps) >= limit:
+            RATE[key] = stamps
+            return False
+        stamps.append(now)
+        RATE[key] = stamps
+        if len(RATE) > 5000:  # মেমরি বাঁচাতে পুরনো এন্ট্রি ঝেড়ে ফেলা
+            for k in [k for k, v in RATE.items() if not v or now - v[-1] > 600]:
+                RATE.pop(k, None)
+    return True
+
+
 # ---------- রুট ----------
 @app.route("/")
 def index():
@@ -152,6 +192,8 @@ def info_route():
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not valid_url(url):
         return jsonify(error="সঠিক লিংক দিন"), 400
+    if not rate_ok("info"):
+        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
     try:
         data = get_info(url, "best")
         return jsonify(
@@ -250,7 +292,7 @@ def disk_download(url, quality):
         opts = {
             **BASE_OPTS,
             "format": FORMATS[quality],
-            "outtmpl": os.path.join(tmp, "%(title).80s.%(ext)s"),
+            "outtmpl": os.path.join(tmp, "video.%(ext)s"),
             "match_filter": lambda info, **kw: (
                 "ভিডিও অনেক বড়" if (info.get("duration") or 0) > MAX_DURATION else None
             ),
@@ -274,7 +316,12 @@ def disk_download(url, quality):
         shutil.rmtree(tmp, ignore_errors=True)
         return response
 
-    return send_file(path, as_attachment=True, download_name=files[0])
+    try:
+        base_info = get_info(url, quality)
+    except Exception:
+        base_info = {}
+    ext = os.path.splitext(files[0])[1].lstrip(".") or "mp4"
+    return send_file(path, as_attachment=True, download_name=make_filename({**base_info, "ext": ext}))
 
 
 @app.route("/api/download")
@@ -286,6 +333,8 @@ def download():
     quality = request.args.get("q", "best")
     if not valid_url(url) or quality not in FORMATS:
         return error_page("ভুল অনুরোধ", 400)
+    if not rate_ok("dl"):
+        return error_page("অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
     try:
         info = get_info(url, quality)
     except Exception as e:
