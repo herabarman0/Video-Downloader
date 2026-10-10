@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>ভিডিও ডাউনলোডার</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
@@ -29,7 +30,10 @@
 
   /* ১৬:৯ প্রিভিউ, ফুল স্ক্রিন নয় */
   .preview { display:none; margin-bottom:12px; }
-  .preview .thumb { width:100%; aspect-ratio:16 / 9; background:#000; border-radius:10px; overflow:hidden; }
+  .preview .thumb { position:relative; width:100%; aspect-ratio:16 / 9; background:#000; border-radius:10px; overflow:hidden; }
+  .preview .thumb video { display:none; width:100%; height:100%; object-fit:contain; background:#000; }
+  .preview .thumb .play { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:58px; height:58px; padding:0; border-radius:50%; background:rgba(0,0,0,.6); border:2px solid #fff; display:flex; align-items:center; justify-content:center; }
+  .preview .thumb .play svg { margin-left:3px; }
   .preview .thumb img { width:100%; height:100%; object-fit:contain; display:block; }
   .preview .t { margin-top:8px; font-weight:600; font-size:15px; }
   .preview .m { color:var(--muted); font-size:13px; }
@@ -60,7 +64,13 @@
   <div class="row"><button id="checkBtn" onclick="checkVideo()">ভিডিও খুঁজুন</button></div>
 
   <div class="preview" id="preview">
-    <div class="thumb"><img id="thumb" alt=""></div>
+    <div class="thumb">
+      <img id="thumb" alt="">
+      <video id="player" controls playsinline preload="none"></video>
+      <button class="play" id="playBtn" type="button" onclick="playPreview()" aria-label="ভিডিও চালান">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="#fff" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+    </div>
     <div class="t" id="title"></div>
     <div class="m" id="meta"></div>
   </div>
@@ -115,7 +125,7 @@
 <script>
   // একই Render সার্ভার থেকে সাইট চালালে খালি রাখুন।
   // আলাদা জায়গায় রাখলে শেষে "/" ছাড়া লিংক দিন, যেমন: "https://downloader-yu1r.onrender.com"
-  const API_BASE = "https://downloader-yu1r.onrender.com";
+  const API_BASE = "";
 
   const $ = id => document.getElementById(id);
   const msg = (t, err) => { $("msg").textContent = t; $("msg").className = err ? "err" : ""; };
@@ -130,10 +140,13 @@
   function fileName() {
     const ext = $("quality").value === "audio" ? "m4a" : "mp4";
     const base = ($("title").textContent || "")
+      // "32K views · 1.1K reactions |" জাতীয় শুরুর অংশ বাদ
+      .replace(/^\s*[\d.,]+\s*[KMBkmb]?\s*(views?|plays?|reactions?|likes?)\b[^|]*\|\s*/i, "")
+      .replace(/\s*\|\s*/g, " - ")
       .replace(/[\uFE00-\uFE0F]/g, "")
       .replace(/[^\p{L}\p{N}\p{M} ._-]+/gu, " ")
       .replace(/\s+/g, " ")
-      .replace(/^[. ]+|[. ]+$/g, "")
+      .replace(/^[. -]+|[. -]+$/g, "")
       .slice(0, 60)
       .trim();
     return (base || "video") + "." + ext;
@@ -165,6 +178,50 @@
     return API_BASE + "/api/download?url=" + encodeURIComponent($("url").value.trim()) + "&q=" + $("quality").value;
   }
 
+  // ---------- ১৬:৯ বক্সের ভেতরেই ভিডিও চালানো ----------
+  // সরাসরি লিংক আছে এমন সাইটে (Facebook, Twitter/X, Vimeo) ফোন সোর্স থেকেই চালায়, সার্ভারের ব্যান্ডউইথ লাগে না
+  function resetPlayer() {
+    const v = $("player");
+    v.pause();
+    v.removeAttribute("src");
+    v.load();
+    v.style.display = "none";
+    $("thumb").style.display = "";
+    $("playBtn").style.display = "";
+  }
+
+  async function playPreview() {
+    const url = $("url").value.trim();
+    if (!url) return;
+    $("playBtn").disabled = true;
+    msg("ভিডিও লোড হচ্ছে...");
+    try {
+      const r = await fetch(API_BASE + "/api/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, q: "best" })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(errText(d));
+      if (d.mode !== "direct") throw new Error("এই সাইটের ভিডিও এখানে চালানো যাবে না, তবে ডাউনলোড করা যাবে।");
+      const v = $("player");
+      v.onerror = () => {
+        if (!v.getAttribute("src")) return;
+        resetPlayer();
+        msg("এই ভিডিও এখানে চালানো গেল না, তবে ডাউনলোড করা যাবে।", true);
+      };
+      v.src = d.url;
+      v.style.display = "block";
+      $("thumb").style.display = "none";
+      $("playBtn").style.display = "none";
+      v.play().catch(() => {});
+      msg("");
+    } catch (e) {
+      msg(e.message, true);
+    }
+    $("playBtn").disabled = false;
+  }
+
   // ---------- লিংক মোছা ----------
   function toggleClear() {
     $("clearBtn").style.display = $("url").value ? "block" : "none";
@@ -175,6 +232,7 @@
     $("preview").style.display = "none";
     $("dlBox").style.display = "none";
     $("result").style.display = "none";
+    resetPlayer();
     $("thumb").removeAttribute("src");
     $("title").textContent = "";
     $("meta").textContent = "";
@@ -191,6 +249,7 @@
     $("preview").style.display = "none";
     $("dlBox").style.display = "none";
     $("result").style.display = "none";
+    resetPlayer();
     try {
       const r = await fetch(API_BASE + "/api/info", {
         method: "POST",
