@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import os
 import re
 import shutil
@@ -5,7 +8,8 @@ import tempfile
 import threading
 import time
 import unicodedata
-from urllib.parse import urlparse
+import uuid
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 import yt_dlp
@@ -119,13 +123,17 @@ def error_page(text, code):
 
 def make_filename(info):
     """নামে # ইমোজি ইত্যাদি থাকলে Android ফাইলের ধরন চিনতে পারে না, তাই শুধু অক্ষর/সংখ্যা রাখি"""
+    raw = info.get("title") or ""
+    # "32K views · 1.1K reactions |" জাতীয় শুরুর অংশ বাদ, বাকি অংশ " - " দিয়ে জোড়া
+    raw = re.sub(r"^\s*[\d.,]+\s*[KMBkmb]?\s*(views?|plays?|reactions?|likes?)\b[^|]*\|\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*\|\s*", " - ", raw)
     out = []
-    for ch in info.get("title") or "":
+    for ch in raw:
         cat = unicodedata.category(ch)
         if 0xFE00 <= ord(ch) <= 0xFE0F:
             continue
         out.append(ch if (cat[0] in "LNM" or ch in " ._-") else " ")
-    title = re.sub(r"\s+", " ", "".join(out)).strip(" .")[:60].strip() or "video"
+    title = re.sub(r"\s+", " ", "".join(out)).strip(" .-")[:60].strip(" .-") or "video"
     return f"{title}.{info.get('ext') or 'mp4'}"
 
 
@@ -252,6 +260,9 @@ def resolve():
         return jsonify(error="ভিডিও অনেক বড়", detail="সর্বোচ্চ %d মিনিট" % (MAX_DURATION // 60)), 400
     direct = single_http_url(info)
     extractor = (info.get("extractor_key") or "").lower()
+    # ব্রাউজারে যেসব সাইট ঠিকমতো নামে না (যেমন Facebook, Instagram) সেগুলো Telegram বট দিয়ে নামবে
+    if BOT_TOKEN and any(extractor.startswith(s) for s in BOT_ONLY_SITES):
+        return jsonify(mode="bot", url=direct)
     if direct and extractor in DIRECT_EXTRACTORS:
         return jsonify(mode="direct", url=direct, filename=make_filename(info))
     return jsonify(mode="server")
@@ -380,6 +391,284 @@ def download():
         if resp is not None:
             return resp
     return disk_download(url, quality)
+
+
+# ====================== Telegram বট ======================
+# লিংক পাঠালে বট লেখা ছাড়া শুধু ভিডিও পাঠায়। Render Environment-এ BOT_TOKEN ও BOT_WEBHOOK_SECRET দিলে চালু হয়।
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_WEBHOOK_SECRET = os.environ.get("BOT_WEBHOOK_SECRET", "").strip()
+SITE_URL = os.environ.get("SITE_URL", "").strip().rstrip("/")
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BOT_MAX_BYTES = 49 * 1024 * 1024          # Bot API-তে ফাইল আপলোডের সীমা ~৫০ MB
+URL_RE = re.compile(r"https?://\S+")
+BOT_RATE = {}
+BOT_RATE_LOCK = threading.Lock()
+
+
+def tg_call(method, timeout=30, **kwargs):
+    try:
+        r = requests.post(f"{BOT_API}/{method}", timeout=timeout, **kwargs)
+        return r.json()
+    except Exception as e:
+        app.logger.error("telegram %s error: %s", method, e)
+        return {"ok": False}
+
+
+def tg_text(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_call("sendMessage", json=payload)
+
+
+def bot_rate_ok(chat_id, limit=6, window=600):
+    now = time.time()
+    with BOT_RATE_LOCK:
+        stamps = [t for t in BOT_RATE.get(chat_id, []) if now - t < window]
+        if len(stamps) >= limit:
+            BOT_RATE[chat_id] = stamps
+            return False
+        stamps.append(now)
+        BOT_RATE[chat_id] = stamps
+    return True
+
+
+def bot_download(url, tmp):
+    """৫০ MB-এর মধ্যে ফাইল পেতে আগে সেরা কোয়ালিটি, না পেলে 360p চেষ্টা করে। না পেলে None"""
+    for q in ("best", "360"):
+        for f in os.listdir(tmp):
+            os.remove(os.path.join(tmp, f))
+        opts = {
+            **BASE_OPTS,
+            "format": FORMATS[q],
+            "outtmpl": os.path.join(tmp, "video.%(ext)s"),
+            "max_filesize": BOT_MAX_BYTES,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        files = [f for f in os.listdir(tmp) if not f.endswith((".part", ".ytdl", ".temp"))]
+        if not files:
+            continue
+        path = os.path.join(tmp, max(files, key=lambda f: os.path.getsize(os.path.join(tmp, f))))
+        if os.path.getsize(path) <= BOT_MAX_BYTES:
+            return path
+    return None
+
+
+def bot_send_file(chat_id, url, info):
+    """সার্ভারে নামিয়ে Telegram-এ আপলোড (সরাসরি লিংক কাজ না করলে এই পথ)"""
+    if not DISK_SLOTS.acquire(blocking=False):
+        tg_text(chat_id, "সার্ভার এখন ব্যস্ত, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        tg_call("sendChatAction", json={"chat_id": chat_id, "action": "upload_video"})
+        path = bot_download(url, tmp)
+        if not path:
+            tg_text(chat_id, "ভিডিওটা পাঠানো গেল না (ফাইল ৫০ MB-এর বেশি হতে পারে)।")
+            return
+        with open(path, "rb") as fh:
+            res = tg_call(
+                "sendVideo", timeout=300,
+                data={"chat_id": chat_id, "supports_streaming": "true"},
+                files={"video": (make_filename({**info, "ext": "mp4"}), fh)},
+            )
+        if not res.get("ok"):
+            app.logger.error("bot upload failed: %s", res)
+            tg_text(chat_id, "ভিডিও পাঠানো গেল না, পরে আবার চেষ্টা করুন।")
+    except Exception as e:
+        app.logger.error("bot download error: %s", e)
+        tg_text(chat_id, friendly(e))
+    finally:
+        DISK_SLOTS.release()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def bot_handle(update):
+    try:
+        msg = update.get("message")
+        if not msg:
+            return
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+
+        # ওয়েবসাইট থেকে আসা "Telegram-এ ভিডিও নিন" লিংক: /start <টোকেন>
+        if text.startswith("/start") and len(text.split(None, 1)) == 2:
+            link = bot_link_pop(text.split(None, 1)[1].strip())
+            if link:
+                bot_handle({"message": {"chat": {"id": chat_id}, "text": link}})
+                return
+
+        if text.startswith(("/start", "/help")):
+            markup = None
+            if SITE_URL:
+                markup = {"inline_keyboard": [[{"text": "ওয়েবসাইট খুলুন", "web_app": {"url": SITE_URL}}]]}
+            tg_text(chat_id, "ভিডিওর লিংক পাঠান, আমি শুধু ভিডিওটা পাঠিয়ে দেব।", markup)
+            return
+
+        m = URL_RE.search(text)
+        if not m:
+            tg_text(chat_id, "ভিডিওর লিংক পাঠান।")
+            return
+        url = m.group(0).rstrip(").,]>\"'")
+        if not valid_url(url):
+            tg_text(chat_id, "সঠিক লিংক দিন।")
+            return
+        blocked = blocked_site(url)
+        if blocked:
+            tg_text(chat_id, blocked_message(blocked))
+            return
+        if not bot_rate_ok(chat_id):
+            tg_text(chat_id, "অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+            return
+
+        tg_call("sendChatAction", json={"chat_id": chat_id, "action": "upload_video"})
+        try:
+            info = get_info(url, "best")
+        except Exception as e:
+            app.logger.error("bot info error: %s", e)
+            tg_text(chat_id, friendly(e))
+            return
+        if (info.get("duration") or 0) > MAX_DURATION:
+            tg_text(chat_id, "ভিডিও অনেক বড় (সর্বোচ্চ %d মিনিট)।" % (MAX_DURATION // 60))
+            return
+
+        # ১) Telegram নিজেই লিংক থেকে ভিডিও টেনে নেয়, সার্ভারের ব্যান্ডউইথ লাগে না
+        direct = single_http_url(info)
+        if direct and (info.get("extractor_key") or "").lower() in DIRECT_EXTRACTORS:
+            res = tg_call("sendVideo", json={"chat_id": chat_id, "video": direct, "supports_streaming": True})
+            if res.get("ok"):
+                return
+            app.logger.info("bot url-send failed: %s", res)
+
+        # ২) না হলে সার্ভারে নামিয়ে আপলোড
+        bot_send_file(chat_id, url, info)
+    except Exception as e:
+        app.logger.error("bot handle error: %s", e)
+
+
+# ---------- ওয়েবসাইট থেকে বটে পাঠানো (যেসব সাইট ব্রাউজারে নামে না) ----------
+BOT_ONLY_SITES = {
+    x.strip().lower()
+    for x in os.environ.get("BOT_ONLY_SITES", "facebook,instagram").split(",")
+    if x.strip()
+}
+BOT_LINKS = {}            # টোকেন -> (সময়, লিংক)
+BOT_LINKS_LOCK = threading.Lock()
+_BOT_NAME = {"v": None}
+
+
+def bot_username():
+    if not _BOT_NAME["v"]:
+        res = tg_call("getMe")
+        _BOT_NAME["v"] = (res.get("result") or {}).get("username")
+    return _BOT_NAME["v"]
+
+
+def bot_link_new(url):
+    token = uuid.uuid4().hex[:16]
+    now = time.time()
+    with BOT_LINKS_LOCK:
+        for k in [k for k, (t, _) in BOT_LINKS.items() if now - t > 600]:
+            BOT_LINKS.pop(k, None)
+        BOT_LINKS[token] = (now, url)
+    return token
+
+
+def bot_link_pop(token):
+    with BOT_LINKS_LOCK:
+        item = BOT_LINKS.pop(token, None)
+    if item and time.time() - item[0] <= 600:
+        return item[1]
+    return None
+
+
+def tg_user_from_init_data(init_data):
+    """Mini App-এর initData যাচাই করে ইউজারের Telegram আইডি দেয়। ভুল হলে None"""
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
+            return None
+        return json.loads(pairs["user"])["id"]
+    except Exception:
+        return None
+
+
+@app.route("/api/bot-send", methods=["POST"])
+def api_bot_send():
+    """Mini App-এর ভেতর থেকে: ভিডিও সরাসরি ইউজারের বট-চ্যাটে পাঠানো হয়"""
+    if not BOT_TOKEN:
+        return jsonify(error="বট চালু নেই"), 400
+    body = request.get_json(silent=True) or {}
+    url = str(body.get("url", "")).strip()
+    if not valid_url(url):
+        return jsonify(error="সঠিক লিংক দিন"), 400
+    chat_id = tg_user_from_init_data(str(body.get("init_data", "")))
+    if chat_id is None:
+        return jsonify(error="Telegram যাচাই হয়নি"), 403
+    blocked = blocked_site(url)
+    if blocked:
+        return jsonify(error=blocked_message(blocked)), 400
+    if not rate_ok("dl"):
+        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
+    threading.Thread(
+        target=bot_handle,
+        args=({"message": {"chat": {"id": chat_id}, "text": url}},),
+        daemon=True,
+    ).start()
+    return jsonify(ok=True)
+
+
+@app.route("/api/bot-link", methods=["POST"])
+def api_bot_link():
+    """সাধারণ ব্রাউজারে: বটের একটা লিংক দেয়, Start চাপলেই ভিডিও আসে"""
+    if not BOT_TOKEN:
+        return jsonify(error="বট চালু নেই"), 400
+    url = str((request.get_json(silent=True) or {}).get("url", "")).strip()
+    if not valid_url(url):
+        return jsonify(error="সঠিক লিংক দিন"), 400
+    blocked = blocked_site(url)
+    if blocked:
+        return jsonify(error=blocked_message(blocked)), 400
+    if not rate_ok("dl"):
+        return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
+    name = bot_username()
+    if not name:
+        return jsonify(error="বট খুঁজে পাওয়া যায়নি"), 500
+    return jsonify(link=f"https://t.me/{name}?start={bot_link_new(url)}")
+
+
+@app.route("/tg/webhook", methods=["POST"])
+def tg_webhook():
+    if not BOT_TOKEN:
+        return "bot off", 404
+    got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not BOT_WEBHOOK_SECRET or not hmac.compare_digest(got, BOT_WEBHOOK_SECRET):
+        return "forbidden", 403
+    update = request.get_json(silent=True) or {}
+    threading.Thread(target=bot_handle, args=(update,), daemon=True).start()
+    return "ok"
+
+
+@app.route("/tg/set-webhook")
+def tg_set_webhook():
+    """একবার খুললেই Telegram-কে এই সার্ভারের ঠিকানা জানিয়ে দেয়"""
+    if not BOT_TOKEN or not BOT_WEBHOOK_SECRET:
+        return "BOT_TOKEN ও BOT_WEBHOOK_SECRET সেট করুন", 400
+    if not hmac.compare_digest(request.args.get("key", ""), BOT_WEBHOOK_SECRET):
+        return "forbidden", 403
+    res = tg_call("setWebhook", json={
+        "url": f"https://{request.host}/tg/webhook",
+        "secret_token": BOT_WEBHOOK_SECRET,
+        "allowed_updates": ["message"],
+    })
+    return jsonify(res)
 
 
 if __name__ == "__main__":
