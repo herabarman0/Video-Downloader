@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from urllib.parse import urlparse
 
 import requests
 import yt_dlp
@@ -72,15 +73,36 @@ def valid_url(url):
     return isinstance(url, str) and url.startswith(("http://", "https://")) and len(url) < 2000
 
 
+# যেসব সাইট এই সার্ভারের IP ব্লক করে, সেগুলো আগেই থামিয়ে সুন্দর বার্তা দেখানো হয়।
+# ভবিষ্যতে প্রক্সি পেলে Render Environment-এ BLOCKED_SITES খালি করে দিলে আবার চালু হবে।
+BLOCKED_SITES = {
+    x.strip().lower()
+    for x in os.environ.get("BLOCKED_SITES", "youtube.com,youtu.be,tiktok.com").split(",")
+    if x.strip()
+}
+SITE_NAMES = {"youtube.com": "YouTube", "youtu.be": "YouTube", "tiktok.com": "TikTok"}
+
+
+def blocked_site(url):
+    host = (urlparse(url).hostname or "").lower()
+    for d in BLOCKED_SITES:
+        if host == d or host.endswith("." + d):
+            return SITE_NAMES.get(d, d)
+    return None
+
+
+UNSUPPORTED_MSG = "এই সাইটের ভিডিও এখন সাপোর্টেড নয়, তাই ডাউনলোড করা যাবে না। পরবর্তী আপডেটের জন্য অপেক্ষা করুন।"
+
+
+def blocked_message(name):
+    return UNSUPPORTED_MSG
+
+
 def friendly(e):
-    t = str(e).replace("ERROR: ", "").strip()
-    if "Sign in to confirm" in t or "not a bot" in t:
-        return "YouTube এই সার্ভারকে ব্লক করেছে (বট চেক)। অন্য সাইটের লিংক দিন বা পরে চেষ্টা করুন।"
-    if "Unsupported URL" in t:
-        return "এই লিংক সাপোর্টেড নয়"
-    if "Private video" in t:
-        return "ভিডিওটা প্রাইভেট"
-    return t[:300]
+    # আসল (লম্বা ইংরেজি) এরর Render-এর Logs-এ থাকে, ইউজারকে শুধু ছোট বার্তা দেখানো হয়
+    if "Private video" in str(e):
+        return "ভিডিওটা প্রাইভেট, ডাউনলোড করা যাবে না।"
+    return UNSUPPORTED_MSG
 
 
 def error_page(text, code):
@@ -192,6 +214,9 @@ def info_route():
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not valid_url(url):
         return jsonify(error="সঠিক লিংক দিন"), 400
+    blocked = blocked_site(url)
+    if blocked:
+        return jsonify(error=blocked_message(blocked)), 400
     if not rate_ok("info"):
         return jsonify(error="অনেকবার চেষ্টা হয়েছে", detail="কিছুক্ষণ পরে আবার চেষ্টা করুন"), 429
     try:
@@ -204,7 +229,7 @@ def info_route():
         )
     except Exception as e:
         app.logger.error("info error: %s", e)
-        return jsonify(error="ভিডিও পাওয়া যায়নি", detail=friendly(e)), 400
+        return jsonify(error=friendly(e)), 400
 
 
 @app.route("/api/resolve", methods=["POST"])
@@ -215,11 +240,14 @@ def resolve():
     quality = body.get("q", "best")
     if not valid_url(url) or quality not in FORMATS:
         return jsonify(error="ভুল অনুরোধ"), 400
+    blocked = blocked_site(url)
+    if blocked:
+        return jsonify(error=blocked_message(blocked)), 400
     try:
         info = get_info(url, quality)
     except Exception as e:
         app.logger.error("resolve error: %s", e)
-        return jsonify(error="ভিডিও পাওয়া যায়নি", detail=friendly(e)), 400
+        return jsonify(error=friendly(e)), 400
     if (info.get("duration") or 0) > MAX_DURATION:
         return jsonify(error="ভিডিও অনেক বড়", detail="সর্বোচ্চ %d মিনিট" % (MAX_DURATION // 60)), 400
     direct = single_http_url(info)
@@ -333,6 +361,9 @@ def download():
     quality = request.args.get("q", "best")
     if not valid_url(url) or quality not in FORMATS:
         return error_page("ভুল অনুরোধ", 400)
+    blocked = blocked_site(url)
+    if blocked:
+        return error_page(blocked_message(blocked), 400)
     if not rate_ok("dl"):
         return error_page("অনেকবার চেষ্টা হয়েছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।", 429)
     try:
