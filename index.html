@@ -11,8 +11,9 @@
     :root { --bg:#0f1220; --card:#181c2e; --text:#e8ebf5; --muted:#99a1b8; --accent:#7c75ff; --err:#ff6b6b; }
   }
   * { box-sizing:border-box; }
-  body { margin:0; font-family:"Noto Sans Bengali",system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; justify-content:center; padding:20px; }
-  .card { width:100%; max-width:480px; background:var(--card); border-radius:16px; padding:22px; height:fit-content; box-shadow:0 4px 20px rgba(0,0,0,.08); }
+  body { margin:0; font-family:"Noto Sans Bengali",system-ui,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; min-height:100dvh; display:flex; padding:20px; }
+  /* margin:auto = শুরুতে পর্দার মাঝখানে, কনটেন্ট বাড়লে কার্ড নিজে বড় হবে */
+  .card { width:100%; max-width:480px; margin:auto; background:var(--card); border-radius:16px; padding:22px; height:fit-content; box-shadow:0 4px 20px rgba(0,0,0,.08); }
   h1 { margin:0 0 4px; font-size:22px; }
   p.sub { margin:0 0 18px; color:var(--muted); font-size:14px; }
   input, select, button, .btn { width:100%; font-size:16px; padding:13px; border-radius:10px; border:1px solid #8884; background:transparent; color:var(--text); font-family:inherit; }
@@ -38,6 +39,13 @@
   #msg { margin-top:12px; font-size:14px; min-height:20px; word-break:break-word; }
   .err { color:var(--err); }
   .note { margin-top:16px; font-size:12px; color:var(--muted); }
+
+  /* ফুটার: নাম + সোশ্যাল আইকন */
+  .footer { margin-top:14px; padding-top:14px; border-top:1px solid #8883; text-align:center; font-size:12px; color:var(--muted); }
+  .footer .icons { display:flex; justify-content:center; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .footer .icons a { display:inline-flex; align-items:center; justify-content:center; width:36px; height:36px; border-radius:50%; border:1px solid #8884; color:var(--muted); text-decoration:none; font-size:17px; }
+  .footer .icons a:active, .footer .icons a:hover { color:var(--accent); border-color:var(--accent); }
+  .footer .sep { width:1px; height:20px; background:#8884; margin:0 2px; }
 </style>
 </head>
 <body>
@@ -77,12 +85,37 @@
 
   <div id="msg"></div>
   <p class="note">শুধু নিজের বা ডাউনলোডের অনুমতি আছে এমন কনটেন্ট ডাউনলোড করুন। কপিরাইট ও সাইটের নিয়ম মানা আপনার দায়িত্ব।</p>
+
+  <div class="footer">
+    <div>© <span id="yr">2026</span> Hera Barman</div>
+    <div class="icons">
+      <a href="https://www.tiktok.com/@luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="TikTok" title="TikTok">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M16.6 3c.3 2.3 1.7 3.9 4 4.1v3.1c-1.5 0-2.9-.5-4-1.3v6.4a6.1 6.1 0 1 1-6.1-6.1c.3 0 .6 0 .9.1v3.2a2.9 2.9 0 1 0 2 2.8V3h3.2z"/></svg>
+      </a>
+      <a href="https://www.youtube.com/@luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="YouTube" title="YouTube">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M21.6 7.2a2.5 2.5 0 0 0-1.8-1.8C18.2 5 12 5 12 5s-6.2 0-7.8.4A2.5 2.5 0 0 0 2.4 7.2C2 8.8 2 12 2 12s0 3.2.4 4.8a2.5 2.5 0 0 0 1.8 1.8C5.8 19 12 19 12 19s6.2 0 7.8-.4a2.5 2.5 0 0 0 1.8-1.8c.4-1.6.4-4.8.4-4.8s0-3.2-.4-4.8zM10 15V9l5.2 3L10 15z"/></svg>
+      </a>
+      <a href="https://www.instagram.com/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Instagram" title="Instagram">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r="1" fill="currentColor" stroke="none"/></svg>
+      </a>
+      <a href="https://t.me/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Telegram" title="Telegram">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M21.9 3.6 2.7 11c-.9.4-.9 1.1-.2 1.3l4.9 1.5 1.9 5.8c.2.6.4.8.8.8.4 0 .6-.2.9-.5l2.4-2.3 4.9 3.6c.9.5 1.5.2 1.7-.8L23 4.7c.3-1.2-.4-1.7-1.1-1.1zM9 14.2l9.2-5.8c.4-.3.8-.1.5.2l-7.6 6.9-.3 3.2L9 14.2z"/></svg>
+      </a>
+      <a href="https://www.facebook.com/luckyhera0" target="_blank" rel="noopener noreferrer" aria-label="Facebook" title="Facebook">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M13.5 21v-8h2.7l.4-3.2h-3.1V7.8c0-.9.3-1.5 1.6-1.5h1.7V3.4c-.3 0-1.3-.1-2.4-.1-2.4 0-4.1 1.5-4.1 4.2v2.3H7.6V13h2.7v8h3.2z"/></svg>
+      </a>
+      <span class="sep"></span>
+      <a href="https://github.com/herabarman0" target="_blank" rel="noopener noreferrer" aria-label="GitHub" title="GitHub">
+        <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+    </div>
+  </div>
 </div>
 
 <script>
   // একই Render সার্ভার থেকে সাইট চালালে খালি রাখুন।
   // আলাদা জায়গায় রাখলে শেষে "/" ছাড়া লিংক দিন, যেমন: "https://downloader-yu1r.onrender.com"
-  const API_BASE = "";
+  const API_BASE = "https://downloader-yu1r.onrender.com";
 
   const $ = id => document.getElementById(id);
   const msg = (t, err) => { $("msg").textContent = t; $("msg").className = err ? "err" : ""; };
@@ -213,6 +246,19 @@
   $("directLink").addEventListener("click", e => {
     if (inTelegram) { e.preventDefault(); goDownload($("directLink").href); }
   });
+
+  // Telegram-এর ভেতরে ফুটারের সোশ্যাল লিংক ঠিকমতো খোলার জন্য
+  document.querySelectorAll(".footer .icons a").forEach(a => {
+    a.addEventListener("click", e => {
+      if (!inTelegram) return;
+      e.preventDefault();
+      if (a.href.startsWith("https://t.me/") && TG.openTelegramLink) TG.openTelegramLink(a.href);
+      else TG.openLink(a.href);
+    });
+  });
+
+  // ফুটারে বছর নিজে থেকে বদলাবে
+  $("yr").textContent = new Date().getFullYear();
 </script>
 </body>
 </html>
